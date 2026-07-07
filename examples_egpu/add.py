@@ -614,6 +614,27 @@ class PolarisDevice:
       return
     if stage == "common":
       b.vi_common_init(); print("stage=common ok"); return
+    if stage == "atom":
+      from atom_replay import run_asic_init_if_needed, vram_training_ok
+      b.vi_common_init(); b.enable_vbios_rom()
+      run_asic_init_if_needed(b)
+      print(f"stage=atom MEMSIZE={b.config_memsize_mb():#x} MISC0={b.rreg(0xa80):#x} "
+            f"trained={vram_training_ok(b)}"); return
+    if stage == "pre-fw":
+      from atom_replay import run_asic_init_if_needed, vram_training_ok
+      b.vi_common_init(); b.enable_vbios_rom()
+      run_asic_init_if_needed(b)
+      if not vram_training_ok(b):
+        b.mc_program_light()
+        with contextlib.suppress(RuntimeError):
+          b.load_mc_firmware()
+      b.gmc_sw_init(); b.start_smc(); b.process_smc_firmware_header()
+      b.mc_program()
+      with contextlib.suppress(RuntimeError):
+        b.load_mc_firmware()
+      ok, reason, bar0, mm = b.load_ip_firmware_prereqs()
+      print(f"stage=pre-fw smc={b.smc_running()} trained={vram_training_ok(b)} "
+            f"bar0={bar0} mm={mm} load_ok={ok} — {reason}"); return
     if stage == "smc":
       try:
         b.start_smc()

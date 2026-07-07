@@ -17,14 +17,36 @@ ATOM_ATI_MAGIC_PTR = 0x30
 ATOM_ATI_MAGIC = b" 761295520"  # 10 bytes at ROM offset 0x30
 ATOM_ROM_TABLE_PTR = 0x48
 ATOM_ROM_MAGIC = b"ATOM"
+ATOM_ROM_ALT_MAGIC = b"MOTA"  # byte-swapped ATOM (NootedRed checkAtomBios)
 ATOM_ROM_MAGIC_PTR = 4
-ATOM_ROM_CMD_PTR = 0x1E
+ATOM_ROM_CMD_PTR = 0x1E   # offset in ROM header → command table (not MDT index 0x1E)
 ATOM_ROM_DATA_PTR = 0x20
+ATOMBIOS_IMAGE_SIZE = 0x10000  # ChefKiss/NootedRed ATOMBIOS.hpp
 ATOM_CMD_INIT = 0
+# Offsets within master *data table header* (linux atom.c, not MDT uint16[] indices)
 ATOM_DATA_FWI_PTR = 0xC
 ATOM_DATA_IIO_PTR = 0x32
 ATOM_FWI_DEFSCLK_PTR = 8
 ATOM_FWI_DEFMCLK_PTR = 0xC
+ATOM_FWI_REVISION_PTR = 4
+ATOM_FWI_MAIN_PARSER_PTR = 0x14
+ATOM_FWI_SCRATCH_REG_PTR = 0x18
+# Master data table uint16[] indices (atom_master_list_of_data_tables_v2_1 field order).
+# NootedRed getVBIOSDataTable<T>(index) uses these, not ATOM_ROM_CMD_PTR.
+MDT_IDX_FIRMWAREINFO = 0x04
+MDT_IDX_POWERPLAYINFO = 0x0F
+MDT_IDX_DISPLAYOBJECTINFO = 0x16
+MDT_IDX_INDIRECT_IO = 0x17
+MDT_IDX_UMC_INFO = 0x18
+MDT_IDX_DCE_INFO = 0x1B
+MDT_IDX_VRAM_INFO = 0x1C
+MDT_IDX_INTEGRATED_SYS = 0x1E
+MDT_IDX_ASIC_PROFILING = 0x1F
+# Polaris dGPU VRAM types (atom_dgpu_vram_type, subset)
+ATOM_MEM_TYPE_GDDR5 = 0x0B
+_DGPU_MEM_TYPE = {
+  0x01: "DDR2", 0x02: "DDR3", 0x03: "DDR4", 0x0B: "GDDR5", 0x10: "GDDR6", 0x11: "HBM",
+}
 ATOM_CT_SIZE_PTR = 0
 ATOM_CT_WS_PTR = 4
 ATOM_CT_PS_PTR = 5
@@ -48,12 +70,16 @@ ATOM_JUMP_OP_COND = (2, 5, 3, 0, 4, 1, 6)  # ALWAYS, EQUAL, BELOW, ABOVE, BELOWO
 ATOM_CASE_MAGIC, ATOM_CASE_END = 0x63, 0x5A5A
 ATOM_IIO_START, ATOM_IIO_END = 1, 9
 ATOM_WS_QUOTIENT, ATOM_WS_REMAINDER, ATOM_WS_DATAPTR = 0x40, 0x41, 0x42
-ATOM_WS_SHIFT, ATOM_WS_FB_WINDOW, ATOM_WS_ATTRIBUTES = 0x43, 0x46, 0x47
+ATOM_WS_SHIFT, ATOM_WS_OR_MASK, ATOM_WS_AND_MASK = 0x43, 0x44, 0x45
+ATOM_WS_FB_WINDOW, ATOM_WS_ATTRIBUTES = 0x46, 0x47
 ATOM_WS_REGPTR = 0x48
 ATOM_EXECUTE_MAX_DEPTH = 32
 ATOM_CMD_TIMEOUT_SEC = float(os.environ.get("AMD_ATOM_JUMP_TIMEOUT_SEC", "120"))
 ATOM_JUMP_MAX_ITERS = int(os.environ.get("AMD_ATOM_JUMP_MAX", "512"))
+# MC / idle registers polled during asic_init memory training
+ATOM_MC_POLL_REGS = frozenset({0xa80, 0x150a, 0xa29, 0xa2a, 0xe50, 0x2004, 0x1})
 ATOM_MAX_WRITES = int(os.environ.get("AMD_ATOM_MAX_WRITES", "65536"))
+ATOM_JUMP_BAIL_MAX = int(os.environ.get("AMD_ATOM_JUMP_BAIL_MAX", "0"))
 ATOM_SCRATCH_BYTES = int(os.environ.get("AMD_ATOM_SCRATCH_KB", "20")) << 10
 mmBIOS_SCRATCH_7 = 0x5D0
 ATOM_S7_ASIC_INIT_COMPLETE_MASK = 0x00000200
@@ -111,6 +137,7 @@ class AtomCard:
     self._n = 0
     self._poll_reads: dict[int, int] = {}
     self._jump_counts: dict[int, int] = {}
+    self._jump_bail_count = 0
     self._drain_every = max(1, int(os.environ.get(
       "AMD_ATOM_DRAIN_EVERY", os.environ.get("AMD_MMIO_DRAIN_EVERY", "32"))))
 
@@ -131,12 +158,34 @@ class AtomCard:
   def reg_read(self, reg: int) -> int:
     reg = self._mmio_reg(reg)
     if reg == 0:
-      return 0
-    val = self.boot.rreg(reg)
-    if val == 0 and os.environ.get("AMD_ATOM_POLL_HACK", "1") != "0":
+      return 0  # mmMM_INDEX is write-only in ATOM indirect sequences
+    retries = int(os.environ.get("AMD_ATOM_POLL_RETRIES", "0"))
+    poll_sleep = float(os.environ.get("AMD_ATOM_POLL_SLEEP_MS", "2")) / 1000.0
+    if reg in ATOM_MC_POLL_REGS:
+      retries = max(retries, int(os.environ.get("AMD_ATOM_MC_POLL_RETRIES", "64")))
+    for attempt in range(max(1, retries)):
+      val = self.boot.rreg(reg)
+      if reg in ATOM_MC_POLL_REGS and attempt + 1 < retries:
+        done = False
+        if reg == 0xa80 and (val & 0x80):
+          done = True
+        elif reg == 0x150a and (val & 0xffff) >= 128:
+          done = True
+        elif reg == 0x1 and val != 0 and val != 0xffffffff:
+          done = True
+        elif reg not in (0xa80, 0x150a, 0x1) and val not in (0, 0xffffffff):
+          done = True
+        if done:
+          break
+        with contextlib.suppress(Exception):
+          self.boot.dev.pci.drain_mmio(bar=5, reg=0x2004)
+        if poll_sleep > 0:
+          time.sleep(poll_sleep)
+      else:
+        break
+    if val == 0 and os.environ.get("AMD_ATOM_POLL_HACK", "0") != "0":
       n = self._poll_reads.get(reg, 0) + 1
       self._poll_reads[reg] = n
-      # VBIOS asic_init spins on low MMIO regs (e.g. 0x0001) until HW sets bits.
       if reg <= 0xff and n > int(os.environ.get("AMD_ATOM_POLL_THRESH", "64")):
         return int(os.environ.get("AMD_ATOM_POLL_VAL", "1"), 0)
     return val
@@ -161,6 +210,83 @@ class AtomCard:
     self.reg_write(reg, val)
 
 
+def check_atom_bios(bios: bytes) -> bool:
+  """NootedRed checkAtomBios + linux amdgpu_atom_parse header checks."""
+  if len(bios) < 0x49:
+    return False
+  if _u16(bios, 0) != ATOM_BIOS_MAGIC:
+    return False
+  base = _u16(bios, ATOM_ROM_TABLE_PTR)
+  if not base or base + 8 > len(bios):
+    return False
+  magic = bios[base + ATOM_ROM_MAGIC_PTR:base + ATOM_ROM_MAGIC_PTR + 4]
+  return magic in (ATOM_ROM_MAGIC, ATOM_ROM_ALT_MAGIC)
+
+
+def mdt_offset(bios: bytes, data_table: int, index: int) -> int:
+  """NootedRed getVBIOSDataTable — offset of master data table entry, or 0."""
+  if data_table + 4 + index * 2 + 2 > len(bios):
+    return 0
+  return _u16(bios, data_table + 4 + index * 2)
+
+
+def parse_firmware_info(bios: bytes, data_table: int) -> dict:
+  """AtomFirmwareInfo via ATOM_DATA_FWI_PTR (asic_init ps[0]/ps[1] source)."""
+  off = _u16(bios, data_table + ATOM_DATA_FWI_PTR)
+  if not off or off + 0x1C > len(bios):
+    return {}
+  return {
+    "off": off,
+    "revision": _u32(bios, off + ATOM_FWI_REVISION_PTR),
+    "def_sclk_10khz": _u32(bios, off + ATOM_FWI_DEFSCLK_PTR),
+    "def_mclk_10khz": _u32(bios, off + ATOM_FWI_DEFMCLK_PTR),
+    "main_call_parser": _u32(bios, off + ATOM_FWI_MAIN_PARSER_PTR),
+    "scratch_reg_start": _u32(bios, off + ATOM_FWI_SCRATCH_REG_PTR),
+  }
+
+
+def parse_vram_info(bios: bytes, data_table: int) -> dict | None:
+  """atom_vram_info_header_v2_3 + first atom_vram_module_v9 (Polaris GDDR5)."""
+  off = mdt_offset(bios, data_table, MDT_IDX_VRAM_INFO)
+  if not off or off + 0x18 > len(bios):
+    return None
+  hdr_size = _u16(bios, off)
+  if hdr_size < 0x18 or off + hdr_size > len(bios):
+    return None
+  mod = off + hdr_size
+  if mod + 0x34 > len(bios):
+    return None
+  mem_type = _u8(bios, mod + 23)
+  return {
+    "off": off,
+    "format_rev": _u8(bios, off + 2),
+    "content_rev": _u8(bios, off + 3),
+    "mc_phyinit_off": _u16(bios, off + 0xA),
+    "post_ucode_init_off": _u16(bios, off + 0x10),
+    "module_num": _u8(bios, off + 0x14),
+    "memory_size_mb": _u32(bios, mod),
+    "channel_enable": _u32(bios, mod + 4),
+    "max_mem_clk_10khz": _u32(bios, mod + 8),
+    "memory_type": mem_type,
+    "memory_type_name": _DGPU_MEM_TYPE.get(mem_type, f"0x{mem_type:02x}"),
+    "channel_num": _u8(bios, mod + 24),
+    "channel_width": _u8(bios, mod + 25),
+    "tuning_set_id": _u8(bios, mod + 27),
+    "part_number": _cstr(bios, mod + 32, 20).decode("ascii", "replace"),
+  }
+
+
+def list_mdt_entries(bios: bytes, data_table: int) -> dict[int, int]:
+  """Non-zero master data table slots → ROM offsets (debug)."""
+  out: dict[int, int] = {}
+  end = min(len(bios), data_table + 4 + 0x23 * 2)
+  for idx in range((end - data_table - 4) // 2):
+    off = _u16(bios, data_table + 4 + idx * 2)
+    if off:
+      out[idx] = off
+  return out
+
+
 def read_vbios_rom(boot: "PolarisBoot", length: int | None = None) -> bytes:
   """vi_read_bios_from_rom via SMC ind-port."""
   vbios_file = os.environ.get("AMD_BOOT_VBIOS_FILE")
@@ -179,8 +305,8 @@ def read_vbios_rom(boot: "PolarisBoot", length: int | None = None) -> bytes:
   if hdr[ATOM_ATI_MAGIC_PTR:ATOM_ATI_MAGIC_PTR + len(ATOM_ATI_MAGIC)] != ATOM_ATI_MAGIC:
     raise RuntimeError("VBIOS missing ATI magic")
   if length is None:
-    length = _u8(hdr, 2) << 9
-  length = (length + 3) & ~3
+    length = min(_u8(hdr, 2) << 9, ATOMBIOS_IMAGE_SIZE)
+  length = min((length + 3) & ~3, ATOMBIOS_IMAGE_SIZE)
   rom = bytearray(length)
   rom[:512] = hdr[:512]
   boot.wreg(mmSMC_IND_INDEX_11, ixROM_INDEX)
@@ -214,13 +340,11 @@ def alloc_atom_scratch(ctx: AtomContext) -> None:
 
 
 def parse_atom_context(bios: bytes) -> AtomContext:
-  if _u16(bios, 0) != ATOM_BIOS_MAGIC:
-    raise ValueError("invalid BIOS magic")
+  if not check_atom_bios(bios):
+    raise ValueError("invalid ATOM BIOS (magic/header)")
   if bios[ATOM_ATI_MAGIC_PTR:ATOM_ATI_MAGIC_PTR + len(ATOM_ATI_MAGIC)] != ATOM_ATI_MAGIC:
     raise ValueError("invalid ATI magic")
   base = _u16(bios, ATOM_ROM_TABLE_PTR)
-  if bios[base + ATOM_ROM_MAGIC_PTR:base + ATOM_ROM_MAGIC_PTR + 4] != ATOM_ROM_MAGIC:
-    raise ValueError("invalid ATOM magic")
   ctx = AtomContext(
     bios=bios,
     cmd_table=_u16(bios, base + ATOM_ROM_CMD_PTR),
@@ -234,26 +358,44 @@ def parse_atom_context(bios: bytes) -> AtomContext:
 def atom_info(bios: bytes) -> dict:
   ctx = parse_atom_context(bios)
   init_off = _u16(bios, ctx.cmd_table + 4 + 2 * ATOM_CMD_INIT)
-  hwi = _u16(bios, ctx.data_table + ATOM_DATA_FWI_PTR)
-  return {
+  fw = parse_firmware_info(bios, ctx.data_table)
+  vram = parse_vram_info(bios, ctx.data_table)
+  mdt = list_mdt_entries(bios, ctx.data_table)
+  info = {
     "bios_len": len(bios),
     "cmd_table": ctx.cmd_table,
     "data_table": ctx.data_table,
     "asic_init_off": init_off,
-    "def_sclk": _u32(bios, hwi + ATOM_FWI_DEFSCLK_PTR) if hwi else 0,
-    "def_mclk": _u32(bios, hwi + ATOM_FWI_DEFMCLK_PTR) if hwi else 0,
+    "def_sclk": fw.get("def_sclk_10khz", 0),
+    "def_mclk": fw.get("def_mclk_10khz", 0),
+    "firmware_revision": fw.get("revision"),
+    "main_call_parser": fw.get("main_call_parser"),
+    "bios_scratch_reg_start": fw.get("scratch_reg_start"),
     "iio_tables": len(ctx.iio),
+    "mdt_count": len(mdt),
+    "mdt_vram_off": mdt.get(MDT_IDX_VRAM_INFO),
+    "mdt_umc_off": mdt.get(MDT_IDX_UMC_INFO),
+    "mdt_pp_off": mdt.get(MDT_IDX_POWERPLAYINFO),
   }
+  if vram:
+    info["vram_mb"] = vram["memory_size_mb"]
+    info["vram_type"] = vram["memory_type_name"]
+    info["vram_channels"] = vram["channel_num"]
+    info["vram_pn"] = vram["part_number"]
+  return info
+
+
+def vram_training_ok(boot: "PolarisBoot") -> bool:
+  mem_mb = boot.rreg(0x150a) & 0xffff
+  misc0 = boot.rreg(0xa80)
+  return mem_mb >= 128 and bool(misc0 & 0x80)
 
 
 def need_asic_init(boot: "PolarisBoot") -> bool:
   if os.environ.get("AMD_BOOT_ATOM_FORCE", "0") == "1":
     return True
-  mem_mb = boot.rreg(0x150a) & 0xffff
-  misc0 = boot.rreg(0xa80)
-  if mem_mb not in (0, 0xffff) and (misc0 & 0x80):
+  if vram_training_ok(boot):
     return False
-  # Scratch bit can be set without real VRAM training (partial/fake init)
   return True
 
 
@@ -358,19 +500,26 @@ class AtomExecutor:
         val = 0
     elif arg == ATOM_ARG_WS:
       idx = _u8(bios, p); ptr[0] = p + 1
-      if idx < len(self.ws):
+      # atom.c: special WS registers 0x40-0x48 take priority over the ws[] array.
+      ws_map = {
+        ATOM_WS_QUOTIENT: g.divmul[0], ATOM_WS_REMAINDER: g.divmul[1],
+        ATOM_WS_DATAPTR: g.data_block, ATOM_WS_SHIFT: g.shift,
+        ATOM_WS_OR_MASK: (1 << g.shift) & 0xFFFFFFFF,
+        ATOM_WS_AND_MASK: (~(1 << g.shift)) & 0xFFFFFFFF,
+        ATOM_WS_FB_WINDOW: g.fb_base, ATOM_WS_ATTRIBUTES: g.io_attr,
+        ATOM_WS_REGPTR: g.reg_block,
+      }
+      if idx in ws_map:
+        val = ws_map[idx]
+      elif idx < len(self.ws):
         val = self.ws[idx]
       else:
-        ws_map = {
-          ATOM_WS_QUOTIENT: g.divmul[0], ATOM_WS_REMAINDER: g.divmul[1],
-          ATOM_WS_DATAPTR: g.data_block, ATOM_WS_SHIFT: g.shift,
-          ATOM_WS_FB_WINDOW: g.fb_base, ATOM_WS_ATTRIBUTES: g.io_attr,
-          ATOM_WS_REGPTR: g.reg_block,
-        }
-        val = ws_map.get(idx, 0)
+        val = 0
     elif arg == ATOM_ARG_ID:
       idx = _u16(bios, p); ptr[0] = p + 2
-      val = idx + g.data_block
+      # atom.c: ID reads the dword at ROM offset (idx + data_block), not the address.
+      off = (idx + g.data_block) & 0xffff
+      val = _u32(bios, off) if off + 4 <= len(bios) else 0
     elif arg == ATOM_ARG_FB:
       idx = _u8(bios, p); ptr[0] = p + 1
       off = (g.fb_base // 4) + idx
@@ -447,15 +596,16 @@ class AtomExecutor:
         raise RuntimeError(f"bad io_mode {g.io_mode}")
     elif arg == ATOM_ARG_WS:
       idx = _u8(g.bios, p); ptr[0] = p + 1
-      if idx < len(self.ws):
-        self.ws[idx] = val
-      elif idx == ATOM_WS_QUOTIENT: g.divmul[0] = val
+      # atom.c: special WS registers 0x40-0x48 take priority over ws[]; OR/AND mask read-only.
+      if idx == ATOM_WS_QUOTIENT: g.divmul[0] = val
       elif idx == ATOM_WS_REMAINDER: g.divmul[1] = val
       elif idx == ATOM_WS_DATAPTR: g.data_block = val
       elif idx == ATOM_WS_SHIFT: g.shift = val
+      elif idx in (ATOM_WS_OR_MASK, ATOM_WS_AND_MASK): pass
       elif idx == ATOM_WS_FB_WINDOW: g.fb_base = val
       elif idx == ATOM_WS_ATTRIBUTES: g.io_attr = val
       elif idx == ATOM_WS_REGPTR: g.reg_block = val & 0xFFFF
+      elif idx < len(self.ws): self.ws[idx] = val
     elif arg == ATOM_ARG_PS:
       idx = _u8(g.bios, p); ptr[0] = p + 1
       if idx < self.ps_size:
@@ -548,16 +698,27 @@ class AtomExecutor:
               cnt = self.card._jump_counts.get(abs_t, 0) + 1
               self.card._jump_counts[abs_t] = cnt
               stuck_n = backward and cnt > ATOM_JUMP_MAX_ITERS
-              if (stuck_t or stuck_n) and os.environ.get("AMD_ATOM_JUMP_BAIL", "1") != "0":
-                if self.debug or os.environ.get("AMD_ATOM_TRACE"):
-                  why = "iters" if stuck_n else "time"
-                  print(f"  atom: bail stuck jump op={op} ({why}) fall through", flush=True)
-                self.card._jump_counts[abs_t] = 0
-                last_jump = 0
-              elif stuck_t and ATOM_CMD_TIMEOUT_SEC > 0:
-                if self.debug:
-                  print(f"  atom: jump loop timeout target={abs_t:#x}", flush=True)
-                raise RuntimeError("ATOM jump loop timeout")
+              if stuck_t or stuck_n:
+                if os.environ.get("AMD_ATOM_JUMP_BAIL", "0") == "1":
+                  self.card._jump_bail_count += 1
+                  if ATOM_JUMP_BAIL_MAX > 0 and self.card._jump_bail_count > ATOM_JUMP_BAIL_MAX:
+                    misc0 = self.card.boot.rreg(0xa80)
+                    mem = self.card.boot.rreg(0x150a) & 0xffff
+                    raise RuntimeError(
+                      f"ATOM jump bail limit ({ATOM_JUMP_BAIL_MAX}) — training incomplete "
+                      f"MISC0={misc0:#x} MEMSIZE={mem}")
+                  if self.debug or os.environ.get("AMD_ATOM_TRACE"):
+                    why = "iters" if stuck_n else "time"
+                    print(f"  atom: bail stuck jump op={op} ({why}) fall through", flush=True)
+                  self.card._jump_counts[abs_t] = 0
+                  last_jump = 0
+                else:
+                  why = "iters" if stuck_n else f"time>{ATOM_CMD_TIMEOUT_SEC}s"
+                  misc0 = self.card.boot.rreg(0xa80)
+                  mem = self.card.boot.rreg(0x150a) & 0xffff
+                  raise RuntimeError(
+                    f"ATOM jump loop stuck op={op} target={abs_t:#x} ({why}) "
+                    f"MISC0={misc0:#x} MEMSIZE={mem} — set AMD_ATOM_JUMP_BAIL=1 to fall through (unsafe)")
               else:
                 if last_jump != abs_t:
                   last_jump, last_jump_t = abs_t, now
@@ -762,12 +923,18 @@ def atom_asic_init(boot: "PolarisBoot", bios: bytes | None = None, debug: bool =
   if ret:
     raise RuntimeError(f"atom asic_init failed ret={ret}")
   boot.mmio_sync_safe()
-  if debug:
-    mem = boot.rreg(0x150a) & 0xffff
-    misc0 = boot.rreg(0xa80)
-    bar0_probe = boot.dev.vram[0:4] if hasattr(boot.dev, 'vram') else b''
+  boot.post_atom_sync()
+  mem = boot.rreg(0x150a) & 0xffff
+  misc0 = boot.rreg(0xa80)
+  trained = vram_training_ok(boot)
+  if debug or os.environ.get("AMD_ATOM_TRACE"):
     print(f"atom: asic_init done writes={ctx.reg_write_count} MEMSIZE={mem:#x} "
-          f"MISC0={misc0:#x} pci={boot.dev.pci.read_config(0,2)&0xffff:#06x}", flush=True)
+          f"MISC0={misc0:#x} trained={trained} pci={boot.dev.pci.read_config(0,2)&0xffff:#06x}", flush=True)
+  if os.environ.get("AMD_BOOT_STRICT_ATOM", "0") == "1" and not trained:
+    raise RuntimeError(
+      f"ATOM training incomplete MEMSIZE={mem} (want >=128) MISC0={misc0:#x} (want bit 0x80)")
+  if not trained and debug:
+    print("atom: warning — training incomplete; LoadUcodes likely fails until MEMSIZE/MISC0 ok", flush=True)
   return ctx
 
 

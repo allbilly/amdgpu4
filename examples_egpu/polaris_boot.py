@@ -1,8 +1,8 @@
 """Polaris10 (RX570 / gfx803) firmware boot for macOS eGPU via TinyGPU.
 
 Ports the VI (gfx8) bring-up path from linux amdgpu:
-  vi_common_init → polaris10_start_smu → gmc_v8_0_mc_program → MC ucode →
-  smu7_request_smu_load_fw → gmc_v8_0_gart_enable → gfx_v8_0_kcq"""
+  vi_common_init → asic_init → start_smc → gmc_v8_0_mc_program → MC ucode →
+  gmc_v8_0_gart_enable → smu7_request_smu_load_fw → gfx_v8_0_kcq"""
 from __future__ import annotations
 import os, struct, math, time, contextlib
 from typing import TYPE_CHECKING
@@ -123,6 +123,8 @@ PAGE_SIZE = 4096
 GART_PTE_FLAGS = 0x73
 
 SMU_HDR_SOFT_REGS_OFF = 0x20000 + 48  # offsetof(SMU74_Firmware_Header, SoftRegisters)
+SMU7_FIRMWARE_HEADER_LOCATION = 0x20000
+SMU74_FIRMWARE_HDR_SOFTREGS = 48
 ixSMU74_UcodeLoadStatus = 0x6c
 mmBIF_DOORBELL_APER_EN = 0x1501
 mmBIF_MM_INDACCESS_CNTL = 0x1500
@@ -243,20 +245,31 @@ class PolarisBoot:
     self.vram_visible_mc = 0
     self._gart_alloc_off = 0x100000
     self._compute: ComputeQueue | None = None
+    self._soft_regs_start = 0
 
   def pci_online(self) -> bool:
-    try:
-      return (self.dev.pci.read_config(0, 2) & 0xffff) == 0x1002
-    except Exception:
-      return False
+    retries = int(os.environ.get("AMD_PCI_ONLINE_RETRIES", "5"))
+    for _ in range(retries):
+      try:
+        if (self.dev.pci.read_config(0, 2) & 0xffff) == 0x1002:
+          return True
+      except Exception:
+        pass
+      time.sleep(0.05)
+    return False
 
   def _check_pci(self, phase: str):
-    if not self.pci_online():
-      raise RuntimeError(
-        f"GPU fell off PCIe during {phase} — replug USB4, then: python3 add.py --reset. "
-        f"Try larger AMD_BOOT_SMC_SYNC (fewer SMC reads during upload) or "
-        f"AMD_BOOT_SMC_POLL_MS (slower post-upload polling)."
-      )
+    if self.pci_online():
+      return
+    time.sleep(0.25)
+    self.dev.pci.drain_mmio(bar=5, reg=0x2004)
+    if self.pci_online():
+      return
+    raise RuntimeError(
+      f"GPU fell off PCIe during {phase} — replug USB4, then: python3 add.py --reset. "
+      f"Try larger AMD_BOOT_SMC_SYNC (fewer SMC reads during upload) or "
+      f"AMD_BOOT_SMC_POLL_MS (slower post-upload polling)."
+    )
 
   def _poll_s(self) -> float:
     return max(0.001, int(os.environ.get("AMD_BOOT_SMC_POLL_MS", "25"))) / 1000.0
@@ -541,7 +554,8 @@ class PolarisBoot:
             f"FW={self.smc_rreg(ixSMU_FIRMWARE):#x}")
 
   def smc_send_msg(self, msg: int, arg: int | None = None, *, label: str | None = None):
-    self._check_pci("SMC msg prep")
+    if msg == PPSMC_MSG_LoadUcodes:
+      self._check_pci("SMC LoadUcodes start")
     deadline = time.time() + self._timeout_s("AMD_BOOT_SMC_MSG_TIMEOUT_S", 30.0)
     delay = self._poll_s()
     while time.time() < deadline:
@@ -558,31 +572,6 @@ class PolarisBoot:
       self.wreg(mmSMC_MSG_ARG_0, arg)
     self.wreg(mmSMC_MESSAGE_0, msg)
     self.mmio_sync_safe()
-    if msg == PPSMC_MSG_LoadUcodes:
-      timeout_s = self._timeout_s("AMD_BOOT_SMC_LOADUCODES_TIMEOUT_S", 120.0)
-      deadline = time.time() + timeout_s
-      delay = self._poll_s()
-      while time.time() < deadline:
-        self._check_pci("SMC LoadUcodes wait")
-        resp = self.rreg(mmSMC_RESP_0) & 0xffff
-        status = self.smc_soft_reg(ixSMU74_UcodeLoadStatus)
-        want = arg if arg is not None else FW_TO_LOAD
-        if (status & want) == want:
-          if int(os.environ.get("DEBUG", "0")):
-            print(f"polaris: SMC LoadUcodes done via UcodeLoadStatus={status:#x}", flush=True)
-          return 1
-        if resp not in (0, 0xffff):
-          if int(os.environ.get("DEBUG", "0")):
-            print(f"polaris: SMC LoadUcodes resp={resp:#x} status={status}", flush=True)
-          if resp not in (1,):
-            raise RuntimeError(f"SMC msg {msg:#x} failed resp={resp:#x}")
-          return resp
-        time.sleep(delay)
-        delay = min(delay * 1.5, 0.25)
-      raise RuntimeError(
-        f"SMC msg {msg:#x} timeout after {timeout_s:.0f}s "
-        f"(RESP={self.rreg(mmSMC_RESP_0):#x} pci_online={self.pci_online()})"
-      )
     timeout_s = self._timeout_s("AMD_BOOT_SMC_MSG_TIMEOUT_S", 30.0)
     deadline = time.time() + timeout_s
     delay = self._poll_s()
@@ -776,16 +765,22 @@ class PolarisBoot:
     return bool(self.mc_io_debug_up13() & (1 << 23))
 
   def vram_mc_offset(self, mc_addr: int) -> int:
-    """Byte offset from vram_start for MM_INDEX access (amdgpu_device_mm_access)."""
-    return (mc_addr - self.vram_start) & 0xffffffffffffffff
+    """MM_INDEX pos: byte offset from vram_start (Linux amdgpu_device_mm_access)."""
+    full_off = (mc_addr - self.vram_start) & 0xffffffffffffffff
+    if os.environ.get("AMD_BOOT_MM_OFFSET", "full") == "visible":
+      return (mc_addr - self.vram_visible_mc) & 0xffffffffffffffff
+    return full_off
+
+  def vram_mc_addr(self, byte_off: int) -> int:
+    return (self.vram_start + byte_off) & 0xffffffffffffffff
 
   def vram_mm_write(self, mc_addr: int, data: bytes):
     """Write VRAM via mmMM_INDEX/mmMM_DATA when BAR0 aperture is dead."""
     pos = self.vram_mc_offset(mc_addr)
     if pos % 4 or len(data) % 4:
       raise ValueError(f"vram_mm_write needs 4-byte alignment pos={pos:#x} len={len(data)}")
-    # Ensure MM indirect VRAM access is enabled (BIF_MM_INDACCESS_CNTL).
     self.wreg(mmBIF_MM_INDACCESS_CNTL, 0)
+    drain_every = int(os.environ.get("AMD_MMIO_DRAIN_EVERY", "128"))
     hi = None
     for i in range(0, len(data), 4):
       p = pos + i
@@ -795,6 +790,8 @@ class PolarisBoot:
         self.wreg(mmMM_INDEX_HI, tmp)
         hi = tmp
       self.wreg(mmMM_DATA, struct.unpack_from('<I', data, i)[0])
+      if drain_every and (i // 4) % drain_every == 0 and i:
+        self.dev.pci.drain_mmio(bar=5, reg=0x2004)
     self.vram_flush()
 
   def vram_mm_read(self, mc_addr: int, size: int) -> bytes:
@@ -829,30 +826,35 @@ class PolarisBoot:
   def probe_vram_mm_writes(self) -> bool:
     """Return True if MM_INDEX VRAM writes work (Linux fallback when BAR0 is dead)."""
     pat = 0xA5A5A5A5
-    mc = self.vram_visible_mc + 0x3000
-    try:
-      self.vram_mm_write(mc, struct.pack('<I', pat))
-      got = struct.unpack('<I', self.vram_mm_read(mc, 4))[0]
-      ok = got == pat
-      if int(os.environ.get("DEBUG", "0")):
-        print(f"polaris: probe_vram_mm mc={mc:#x} wrote={pat:#x} read={got:#x} ok={ok}", flush=True)
-      return ok
-    except Exception as e:
-      if int(os.environ.get("DEBUG", "0")):
-        print(f"polaris: probe_vram_mm failed: {e}", flush=True)
-      return False
+    offs = [0x3000, 0x10000, self.vram_visible_mc - self.vram_start + 0x3000]
+    for off in offs:
+      off &= 0xffffffff
+      mc = self.vram_mc_addr(off)
+      try:
+        self.vram_mm_write(mc, struct.pack('<I', pat))
+        got = struct.unpack('<I', self.vram_mm_read(mc, 4))[0]
+        ok = got == pat
+        if int(os.environ.get("DEBUG", "0")):
+          print(f"polaris: probe_vram_mm off={off:#x} mc={mc:#x} wrote={pat:#x} read={got:#x} ok={ok}", flush=True)
+        if ok:
+          return True
+      except Exception as e:
+        if int(os.environ.get("DEBUG", "0")):
+          print(f"polaris: probe_vram_mm off={off:#x} failed: {e}", flush=True)
+    return False
 
   def mc_init_locations(self):
     mem_mb = self.rreg(mmCONFIG_MEMSIZE) & 0xffff
-    if mem_mb in (0, 0xffff):
+    fb_loc = self.rreg(mmMC_VM_FB_LOCATION)
+    if fb_loc not in (0, 0xffffffff):
+      self.vram_start = ((fb_loc & 0xffff) << 24) & 0xffffffff
+    else:
+      self.vram_start = 0
+    if mem_mb in (0, 0xffff) or mem_mb < 128:
       mem_mb = int(os.environ.get("AMD_VRAM_MB", "4096"))
     self.vram_size = mem_mb * 1024 * 1024
-    fb_loc = self.rreg(mmMC_VM_FB_LOCATION)
-    base = int(fb_loc & 0xffff) << 24
-    if base == 0 and self.vram_size and self.vram_size < (1 << 32):
-      base = ((1 << 32) - self.vram_size) & 0xffffffff
-    self.vram_start = base & 0xffffffff
     self.vram_end = (self.vram_start + self.vram_size - 1) & 0xffffffff
+    # VBIOS partial FB (e.g. 0xf400f400) + large override would wrap — normalize at mc_program_light
     bar_bytes = self.dev.bar0_size
     if self.vram_size > bar_bytes:
       self.vram_visible_mc = (self.vram_end - bar_bytes + 1) & 0xffffffff
@@ -896,7 +898,36 @@ class PolarisBoot:
         return
       time.sleep(0.001)
 
+  def mc_program_light(self):
+    """Minimal MC when VRAM not fully trained — avoid clobbering VBIOS apertures."""
+    self.mc_init_locations()
+    self.dev._vram_start = self.vram_visible_mc
+    mem_mb = self.rreg(mmCONFIG_MEMSIZE) & 0xffff
+    want_mb = int(os.environ.get("AMD_VRAM_MB", "4096"))
+    if mem_mb < 128 and want_mb >= 128:
+      self.vram_start = 0
+      self.vram_size = want_mb * 1024 * 1024
+      self.vram_end = (self.vram_size - 1) & 0xffffffff
+      bar_bytes = self.dev.bar0_size
+      self.vram_visible_mc = (self.vram_end - bar_bytes + 1) & 0xffffffff if self.vram_size > bar_bytes else self.vram_start
+      self.dev._vram_start = self.vram_visible_mc
+      self.wreg(mmCONFIG_MEMSIZE, want_mb)
+      tmp = ((self.vram_end >> 24) & 0xffff) << 16 | ((self.vram_start >> 24) & 0xffff)
+      self.wreg(mmMC_VM_FB_LOCATION, tmp)
+    self.wreg(mmBIF_FB_EN, 0x3)
+    self.mmio_sync_safe()
+    if int(os.environ.get("DEBUG", "0")):
+      print(f"polaris: mc_program_light FB_LOC={self.rreg(mmMC_VM_FB_LOCATION):#x} "
+            f"MEMSIZE={self.config_memsize_mb()} vram={self.vram_start:#x}-{self.vram_end:#x} "
+            f"visible={self.vram_visible_mc:#x}", flush=True)
+
   def mc_program(self):
+    mode = os.environ.get("AMD_BOOT_MC_PROGRAM", "auto")
+    if mode == "light" or (mode == "auto" and not self.vram_trained()):
+      self.mc_program_light()
+      return
+    if mode == "skip":
+      return
     self.mc_wait_idle()
     self.mc_init_locations()
     self.dev._vram_start = self.vram_visible_mc
@@ -918,7 +949,7 @@ class PolarisBoot:
     mem_mb = self.rreg(mmCONFIG_MEMSIZE) & 0xffff
     if mem_mb in (0, 0xffff) and self.vram_size:
       self.wreg(mmCONFIG_MEMSIZE, self.vram_size // (1024 * 1024))
-    if os.environ.get("AMD_BOOT_HDP_NONSURFACE", "1") == "1":
+    if os.environ.get("AMD_BOOT_HDP_NONSURFACE", "0") == "1":
       self.wreg(mmHDP_NONSURFACE_BASE, self.vram_start >> 8)
       self.wreg(mmHDP_NONSURFACE_INFO, (2 << 7) | (1 << 30))
       self.wreg(mmHDP_NONSURFACE_SIZE, 0x3fffffff)
@@ -959,6 +990,7 @@ class PolarisBoot:
     self.wreg(mmMC_SEQ_SUP_CNTL, 1)
     timeout_s = self._timeout_s("AMD_BOOT_MC_TIMEOUT_S", 5.0)
     deadline = time.time() + timeout_s
+    wait_logged = False
     while time.time() < deadline:
       misc0 = self.rreg(mmMC_SEQ_MISC0)
       if misc0 & 0x80:
@@ -969,8 +1001,9 @@ class PolarisBoot:
         self.dev._vram_start = self.vram_visible_mc
         self.mc_program_fb_location()
         return
-      if int(os.environ.get("DEBUG", "0")):
+      if int(os.environ.get("DEBUG", "0")) and not wait_logged:
         print(f"polaris: MC training wait MISC0={misc0:#x}", flush=True)
+        wait_logged = True
       time.sleep(0.01)
     raise RuntimeError(f"MC ucode training timeout MISC0={self.rreg(mmMC_SEQ_MISC0):#x}")
 
@@ -1156,30 +1189,55 @@ class PolarisBoot:
     if self.gart_pte_mem is None:
       self.gart_enable()
 
-  def _flush_fw_sysmem(self, layout: str, fw_mem):
+  def _flush_fw_sysmem(self, layout: str, fw_mem, extra=None):
     """ARM/M1: CPU cache may hide sysmem writes from eGPU DMA (rpi-pcie #756)."""
-    if layout not in ("hybrid", "agp", "gtt") or fw_mem is None:
+    if layout not in ("hybrid", "agp", "gtt"):
       return
     from add import sysmem_dma_flush
-    sysmem_dma_flush(fw_mem, SMU_FW_BUF_SIZE)
+    for m, sz in [(fw_mem, SMU_FW_BUF_SIZE)] + (extra or []):
+      if m is not None:
+        sysmem_dma_flush(m, sz)
     if int(os.environ.get("DEBUG", "0")):
       print("polaris: sysmem_dma_flush fw_buf", flush=True)
 
-  def load_ip_firmware(self):
-    """Linux smu7_request_smu_load_fw — runs before gmc_v8_0_gart_enable on VI."""
-    if not self.smc_running():
-      raise RuntimeError("SMC not running before load_ip_firmware")
-    fw_mask = int(os.environ.get("AMD_BOOT_FW_MASK", str(FW_TO_LOAD)), 0)
+  def load_ip_firmware_prereqs(self) -> tuple[bool, str, bool, bool]:
+    """Whether LoadUcodes is safe: Linux needs VRAM (BAR0 or MM_INDEX) for TOC/scratch."""
     bar0_ok = self.probe_bar0_writes()
     mm_ok = self.probe_vram_mm_writes() if not bar0_ok else False
+    if self.vram_trained():
+      return True, "vram_trained", bar0_ok, mm_ok
+    if bar0_ok or mm_ok:
+      return True, f"bar0={bar0_ok} mm_index={mm_ok}", bar0_ok, mm_ok
+    return False, (
+      "VRAM not trained (need MEMSIZE>=128 and MISC0|0x80) and BAR0/MM_INDEX dead — "
+      "Linux puts header_buffer/smu_buffer in VRAM; GTT-only LoadUcodes will hang"
+    ), bar0_ok, mm_ok
+
+  def load_ip_firmware(self):
+    """Linux smu7_request_smu_load_fw — after gmc_v8_0_hw_init (mc_program + gart_enable)."""
+    if not self.smc_running():
+      raise RuntimeError("SMC not running before load_ip_firmware")
+    self.mc_init_locations()
+    self.dev._vram_start = self.vram_visible_mc
+    fw_mask = int(os.environ.get("AMD_BOOT_FW_MASK", str(FW_TO_LOAD)), 0)
+    allowed, reason, bar0_ok, mm_ok = self.load_ip_firmware_prereqs()
+    if not allowed and os.environ.get("AMD_BOOT_LOADUCODES_UNTRAINED", "0") != "1":
+      raise RuntimeError(f"LoadUcodes refused: {reason}")
+    if not allowed:
+      print(f"polaris: WARNING — forced LoadUcodes on untrained VRAM (high PCIe drop risk)", flush=True)
     layout = os.environ.get("AMD_BOOT_FW_LAYOUT", "auto")
     if layout == "auto":
       if bar0_ok:
         layout = "vram"
-      elif os.environ.get("AMD_BOOT_FW_GTT", "0") == "1":
-        layout = "gtt"
+      elif mm_ok:
+        layout = "hybrid"  # Linux: VRAM header/smu + GART fw_buf
       else:
-        layout = "hybrid"  # VRAM MC header/smu (MM_INDEX) + AGP fw images
+        layout = "gtt"
+        if int(os.environ.get("DEBUG", "0")):
+          print(f"polaris: auto layout gtt ({reason})", flush=True)
+    if layout == "gtt" and not allowed:
+      raise RuntimeError(
+        "GTT-only firmware layout unusable without VRAM path — fix ATOM/MC training first")
     use_gtt = layout == "gtt"
     use_phys = layout in ("agp",) or os.environ.get("AMD_BOOT_FW_PHYS_ADDR", "0") == "1"
 
@@ -1187,8 +1245,8 @@ class PolarisBoot:
       self.ensure_gart_ready()
       smu_dram_off = round_up(0x100000, PAGE_SIZE)
       hdr_off = round_up(smu_dram_off + SMU_FW_BUF_SIZE, PAGE_SIZE)
-      smu_dram_gpu = self.vram_visible_mc + smu_dram_off
-      hdr_gpu = self.vram_visible_mc + hdr_off
+      smu_dram_gpu = self.vram_mc_addr(smu_dram_off)
+      hdr_gpu = self.vram_mc_addr(hdr_off)
       fw_gpu_base, fw_mem, _, fw_paddrs = self.alloc_fw_buffer(SMU_FW_BUF_SIZE)
       if not fw_gpu_base or not fw_paddrs:
         raise RuntimeError("hybrid layout needs GART-mapped contiguous fw_buf")
@@ -1226,31 +1284,41 @@ class PolarisBoot:
       fw_mem = mem
       hdr_off_vram = hdr_off
     elif use_gtt:
-      if self.gart_pte_mem is None and os.environ.get("AMD_BOOT_FW_GTT", "0") != "1":
+      self.ensure_gart_ready()
+      if self.gart_pte_mem is None:
         raise RuntimeError("GART not enabled; call gart_enable before GTT load_ip_firmware")
-      smu_dram_gpu, smu_dram_mem, _, smu_paddrs = self.alloc_fw_buffer(SMU_FW_BUF_SIZE)
-      hdr_gpu, hdr_mem, _, hdr_paddrs = self.alloc_fw_buffer(SMU_HDR_BUF_SIZE)
-      fw_gpu_base, fw_mem, _, fw_paddrs = self.alloc_fw_buffer(SMU_FW_BUF_SIZE)
-      if not smu_dram_gpu or not hdr_gpu or not fw_gpu_base:
-        raise RuntimeError("failed to map firmware buffers in GART")
-      fw_paddr_base = fw_paddrs[0] & ~0xfff if fw_paddrs else 0
-      mem = hdr_mem
-      if use_phys and smu_paddrs:
-        smu_dram_gpu = smu_paddrs[0] & ~0xfff
-      if use_phys and hdr_paddrs:
-        hdr_gpu = hdr_paddrs[0] & ~0xfff
+      total = SMU_FW_BUF_SIZE + SMU_HDR_BUF_SIZE + SMU_FW_BUF_SIZE
+      mem, paddrs, nbytes = self.alloc_sysmem_buffer(total, contiguous=True)
+      if not paddrs:
+        raise RuntimeError("gtt layout needs contiguous sysmem")
+      base_va = self.map_sysmem_gpu(paddrs, nbytes)
+      smu_off = 0
+      hdr_off = SMU_FW_BUF_SIZE
+      fw_off = SMU_FW_BUF_SIZE + SMU_HDR_BUF_SIZE
+      smu_dram_gpu = base_va + smu_off
+      hdr_gpu = base_va + hdr_off
+      fw_gpu_base = base_va + fw_off
+      smu_dram_mem = mem
+      hdr_mem = mem
+      fw_paddr_base = paddrs[0] & ~0xfff
+      if use_phys:
+        smu_dram_gpu = paddrs[0] & ~0xfff
+        hdr_gpu = (paddrs[0] & ~0xfff) + hdr_off
+        fw_gpu_base = (paddrs[0] & ~0xfff) + fw_off
 
       def writer(off: int, image: bytes):
-        fw_mem[off:off + len(image)] = image
+        mem[fw_off + off:fw_off + off + len(image)] = image
 
       def addr_fixup(mc_addr: int, _image: bytes) -> int:
-        if not use_phys or not fw_paddr_base:
+        if not use_phys:
           return mc_addr
         return fw_paddr_base + (mc_addr - fw_gpu_base)
 
-      layout_tag = "gtt" + ("-phys" if use_phys else "")
+      layout_tag = "gtt-contig" + ("-phys" if use_phys else "")
       addr_fixup_fn = addr_fixup
       vram_writer = None
+      fw_mem = mem
+      self.gart_flush_tlb()
     else:
       smu_dram_off = self.dev.alloc_vram(SMU_FW_BUF_SIZE, align=PAGE_SIZE)
       hdr_off = self.dev.alloc_vram(SMU_HDR_BUF_SIZE, align=PAGE_SIZE)
@@ -1283,44 +1351,55 @@ class PolarisBoot:
       for ucode_id, ver, addr, sz, flags in entries:
         toc += pack_smu_toc_entry(ucode_id, ver, addr, sz, flags)
     if layout == "hybrid":
-      if not mm_ok and os.environ.get("AMD_BOOT_FORCE_HYBRID", "1") != "1":
-        raise RuntimeError("hybrid layout needs MM_INDEX VRAM writes (BAR0 dead and MM_INDEX probe failed; set AMD_BOOT_FORCE_HYBRID=1 to try anyway)")
-      if not mm_ok and int(os.environ.get("DEBUG", "0")):
-        print("polaris: WARNING hybrid layout with failed MM_INDEX probe", flush=True)
-      vram_writer(smu_dram_gpu, bytes(SMU_FW_BUF_SIZE))
+      if os.environ.get("AMD_BOOT_SMU_SCRATCH_WRITE", "0") == "1":
+        vram_writer(smu_dram_gpu, bytes(SMU_FW_BUF_SIZE))
       vram_writer(hdr_gpu, toc)
     elif layout == "agp":
       mem[hdr_off_vram:hdr_off_vram + len(toc)] = toc
     elif use_gtt:
-      mem[0:len(toc)] = toc
+      mem[hdr_off:hdr_off + len(toc)] = toc
     else:
       if bar0_ok:
         self.dev.upload(hdr_off, toc)
       else:
         self.vram_mm_write(hdr_gpu, toc)
-    self._flush_fw_sysmem(layout, fw_mem if layout in ("hybrid", "agp", "gtt") else None)
-    self.vram_flush()
+    flush_extra = []
+    if layout == "gtt":
+      flush_extra = [(mem, min(total, nbytes))]
+    self._flush_fw_sysmem(layout, fw_mem if layout in ("hybrid", "agp", "gtt") else None, flush_extra)
+    if layout != "agp":
+      self.vram_flush()
     if int(os.environ.get("DEBUG", "0")):
       soft = self.read_soft_regs_start()
       print(f"polaris: load_ip_firmware {layout_tag} soft_regs={soft:#x} "
             f"smu_dram={smu_dram_gpu:#x} hdr={hdr_gpu:#x} fw_buf={fw_gpu_base:#x} mask={fw_mask:#x}", flush=True)
       for ucode_id, ver, addr, sz, flags in entries:
         print(f"  toc id={ucode_id} ver={ver:#x} addr={addr:#x} sz={sz:#x} flags={flags}", flush=True)
-    self.clear_ucode_load_status()
-    if int(os.environ.get("DEBUG", "0")):
-      pre = self.smc_soft_reg(ixSMU74_UcodeLoadStatus)
-      print(f"polaris: UcodeLoadStatus before LoadUcodes={pre}", flush=True)
-    settle = self._settle_s()
+    if os.environ.get("AMD_BOOT_SKIP_UCODE_CLEAR", "0") != "1":
+      self.clear_ucode_load_status()
+    settle = min(self._settle_s(), float(os.environ.get("AMD_BOOT_LOADUCODES_SETTLE_MS", "200")) / 1000.0)
     if settle > 0:
       time.sleep(settle)
     self.dev.pci.drain_mmio(bar=5, reg=0x2004)
-    self._check_pci("LoadUcodes prep")
-    self.smc_send_msg(PPSMC_MSG_SMU_DRAM_ADDR_HI, smu_dram_gpu >> 32, label="SMU_DRAM_HI")
-    self.smc_send_msg(PPSMC_MSG_SMU_DRAM_ADDR_LO, smu_dram_gpu & 0xffffffff, label="SMU_DRAM_LO")
-    self.smc_send_msg(PPSMC_MSG_DRV_DRAM_ADDR_HI, hdr_gpu >> 32, label="DRV_DRAM_HI")
-    self.smc_send_msg(PPSMC_MSG_DRV_DRAM_ADDR_LO, hdr_gpu & 0xffffffff, label="DRV_DRAM_LO")
-    self.smc_send_msg(PPSMC_MSG_LoadUcodes, fw_mask, label="LoadUcodes")
-    if not self.wait_ucode_load(fw_mask, timeout_s=self._timeout_s("AMD_BOOT_UCODE_LOAD_TIMEOUT_S", 30.0)):
+    skip_smu_dram = os.environ.get("AMD_BOOT_SMC_SKIP_DRAM", "0") == "1"
+    msgs = []
+    if not skip_smu_dram:
+      msgs += [
+        (PPSMC_MSG_SMU_DRAM_ADDR_HI, smu_dram_gpu >> 32, "SMU_DRAM_HI"),
+        (PPSMC_MSG_SMU_DRAM_ADDR_LO, smu_dram_gpu & 0xffffffff, "SMU_DRAM_LO"),
+      ]
+    msgs += [
+      (PPSMC_MSG_DRV_DRAM_ADDR_HI, hdr_gpu >> 32, "DRV_DRAM_HI"),
+      (PPSMC_MSG_DRV_DRAM_ADDR_LO, hdr_gpu & 0xffffffff, "DRV_DRAM_LO"),
+      (PPSMC_MSG_LoadUcodes, fw_mask, "LoadUcodes"),
+    ]
+    for msg, arg, label in msgs:
+      if settle > 0:
+        time.sleep(settle / 3)
+      if int(os.environ.get("DEBUG", "0")):
+        print(f"polaris: SMC send {label} arg={arg:#x}", flush=True)
+      self.smc_send_msg(msg, arg, label=label)
+    if not self.wait_ucode_load(fw_mask, timeout_s=self._timeout_s("AMD_BOOT_UCODE_LOAD_TIMEOUT_S", 20.0)):
       resp = self.rreg(mmSMC_RESP_0) & 0xffff
       status = self.smc_soft_reg(ixSMU74_UcodeLoadStatus)
       status_s = f"{status:#x}" if status is not None else "garbage"
@@ -1342,9 +1421,21 @@ class PolarisBoot:
       self._compute.setup_with_kiq()
     return self._compute
 
+  def process_smc_firmware_header(self):
+    """polaris10_process_firmware_header — read SoftRegisters ptr from SMC FW header."""
+    vals = self.read_smc_ram(SMU7_FIRMWARE_HEADER_LOCATION + SMU74_FIRMWARE_HDR_SOFTREGS, 1)
+    val = vals[0] if vals else 0
+    if self._smc_val_ok(val):
+      self._soft_regs_start = val
+      if int(os.environ.get("DEBUG", "0")):
+        print(f"polaris: SMC soft_regs_start={val:#x}", flush=True)
+    elif int(os.environ.get("DEBUG", "0")):
+      print(f"polaris: SMC firmware header SoftRegisters invalid ({val:#x})", flush=True)
+
   def read_soft_regs_start(self) -> int:
-    val = self.smc_read(SMU_HDR_SOFT_REGS_OFF)
-    return val if val is not None else 0
+    if not self._soft_regs_start:
+      self.process_smc_firmware_header()
+    return self._soft_regs_start
 
   def smc_soft_reg(self, offset: int) -> int:
     base = self.read_soft_regs_start()
@@ -1363,46 +1454,101 @@ class PolarisBoot:
   def wait_ucode_load(self, fw_mask: int, timeout_s: float = 60.0) -> bool:
     deadline = time.time() + timeout_s
     last_status = -1
+    poll = max(0.05, float(os.environ.get("AMD_BOOT_UCODE_POLL_MS", "100")) / 1000.0)
+    n = 0
     while time.time() < deadline:
+      n += 1
+      if n % 5 == 0:
+        with contextlib.suppress(RuntimeError):
+          self._check_pci("ucode load poll")
       status = self.smc_soft_reg(ixSMU74_UcodeLoadStatus)
       if status != last_status and int(os.environ.get("DEBUG", "0")):
         print(f"polaris: UcodeLoadStatus={status:#x} (want {fw_mask:#x})", flush=True)
         last_status = status
       if (status & fw_mask) == fw_mask:
         return True
-      time.sleep(0.01)
+      time.sleep(poll)
     return False
+
+  def post_atom_sync(self):
+    """HDP flush/invalidate after ATOM VRAM/MM writes (vi_flush_hdp path)."""
+    self.hdp_flush()
+    self.hdp_invalidate()
+    self.mmio_sync_safe()
 
   def boot(self):
     if self.dev.gpu_ready():
       return
-    # Linux: amdgpu_atom_asic_init before ip_init (SMC / mc_program / LoadUcodes)
+    from atom_replay import run_asic_init_if_needed, vram_training_ok
     self.vi_common_init()
     self.enable_vbios_rom()
-    from atom_replay import run_asic_init_if_needed
     run_asic_init_if_needed(self)
+    if not vram_training_ok(self):
+      self.mc_program_light()
+      try:
+        self.load_mc_firmware()
+        if int(os.environ.get("DEBUG", "0")):
+          print(f"polaris: post-atom MC MISC0={self.rreg(mmMC_SEQ_MISC0):#x} "
+                f"MEMSIZE={self.config_memsize_mb()}", flush=True)
+      except RuntimeError as e:
+        if int(os.environ.get("DEBUG", "0")):
+          print(f"polaris: post-atom MC load ({e})", flush=True)
     self.gmc_sw_init()
     self.start_smc()
+    self.process_smc_firmware_header()
+    # Linux: gmc_v8_0_hw_init (mc_program + MC ucode) before amdgpu_device_fw_loading
     self.mc_program()
     try:
       self.load_mc_firmware()
       if int(os.environ.get("DEBUG", "0")):
         mem_mb = self.rreg(mmCONFIG_MEMSIZE) & 0xffff
-        print(f"polaris: MC training ok MEMSIZE={mem_mb:#x}", flush=True)
+        misc0 = self.rreg(mmMC_SEQ_MISC0)
+        print(f"polaris: pre-LoadUcodes MC MISC0={misc0:#x} MEMSIZE={mem_mb:#x}", flush=True)
+    except RuntimeError as e:
+      if int(os.environ.get("AMD_BOOT_STRICT_MC", "0")):
+        raise
+      if int(os.environ.get("DEBUG", "0")):
+        print(f"polaris: pre-LoadUcodes MC load ({e})", flush=True)
+    fw_allowed, fw_reason, bar0_ok, mm_ok = self.load_ip_firmware_prereqs()
+    if int(os.environ.get("DEBUG", "0")):
+      print(f"polaris: FW probe bar0={bar0_ok} mm_index={mm_ok} allowed={fw_allowed} "
+            f"MEMSIZE={self.config_memsize_mb()} MISC0={self.rreg(mmMC_SEQ_MISC0):#x}", flush=True)
+      if not fw_allowed:
+        print(f"polaris: {fw_reason}", flush=True)
+    fw_layout = os.environ.get("AMD_BOOT_FW_LAYOUT", "auto")
+    need_gart = fw_layout in ("gtt", "hybrid", "agp") or (fw_layout == "auto" and not bar0_ok)
+    if need_gart:
+      self.gart_enable()
+    if self.smc_running():
+      force = os.environ.get("AMD_BOOT_LOADUCODES_UNTRAINED", "0") == "1"
+      if fw_allowed:
+        self.load_ip_firmware()
+      elif force:
+        print("polaris: WARNING — AMD_BOOT_LOADUCODES_UNTRAINED=1 (crash risk)", flush=True)
+        self.load_ip_firmware()
+      else:
+        print(f"polaris: skip LoadUcodes ({fw_reason})", flush=True)
+    try:
+      self.load_mc_firmware()
+      if int(os.environ.get("DEBUG", "0")):
+        mem_mb = self.rreg(mmCONFIG_MEMSIZE) & 0xffff
+        misc0 = self.rreg(mmMC_SEQ_MISC0)
+        print(f"polaris: MC training MISC0={misc0:#x} MEMSIZE={mem_mb:#x}", flush=True)
     except RuntimeError as e:
       if int(os.environ.get("AMD_BOOT_STRICT_MC", "0")):
         raise
       if int(os.environ.get("DEBUG", "0")):
         print(f"polaris: MC load skipped ({e})", flush=True)
-    # GART PTE bind (Linux sw_init) must be live before LoadUcodes on eGPU.
-    self.gart_enable()
-    if self.smc_running():
-      self.load_ip_firmware()
-    # gart_enable is idempotent if already called above
-    self.gart_enable()
+    if self.gart_pte_mem is None:
+      self.gart_enable()
     self.enable_compute()
     self.init_compute_queue()
     if not self.dev.gpu_ready() and self.rreg(mmCP_MEC_CNTL) == 0x50000000:
+      if not vram_training_ok(self):
+        raise RuntimeError(
+          "Polaris boot stopped safely: VRAM not trained — LoadUcodes skipped. "
+          "Need ATOM training (MEMSIZE>=128, MISC0|0x80) or working MM_INDEX. "
+          "Do not set AMD_BOOT_LOADUCODES_UNTRAINED=1 unless VRAM path works.")
       raise RuntimeError(
         f"Polaris boot incomplete: SMC={self.smc_running()} "
         f"CP_HQD_ACTIVE={self.rreg(mmCP_HQD_ACTIVE):#x}"
