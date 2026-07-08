@@ -1,3 +1,5 @@
+linux code at ref/linux
+
 ask deepwiki on github repo
 - kc9zda/atombios-inspect
 - Zile995/PinnacleRidge-Polaris-GPU-Passthrough

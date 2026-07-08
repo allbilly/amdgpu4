@@ -8,11 +8,12 @@
 
 | Item | State |
 |------|--------|
-| **Solved** | ATOM `asic_init` completes — VRAM trains (`MEMSIZE=4096`, `MISC0\|0x80`, `trained=True`) |
-| **Blocker** | No CPU-visible VRAM data path after training — BAR0 and MM_INDEX dead on TinyGPU/USB4 |
-| **Danger** | `LoadUcodes` / unproven GART DMA **kernel-panics macOS** (full reboot; not a soft USB4 disconnect) |
-| **Next** | (1) single-page GART DMA probe, (2) TrustOS-style direct MMIO firmware upload, (3) compute |
-| **Safe** | `--probe`, `--selftest`, `--boot-stage=atom`, `--boot-stage=pre-fw` |
+| **Solved** | ATOM `asic_init` — VRAM trains (`MEMSIZE=4096`, `MISC0\|0x80`, `trained=True`) |
+| **Solved** | Direct MMIO firmware upload path (bypasses SMC `LoadUcodes`) |
+| **Blocker** | `CP_HQD_ACTIVE=0` — KIQ/KCQ not activating; **SRBM field layout was wrong** (fixed in code, not yet verified on HW) |
+| **Danger** | **`--boot-stage=fw-direct` with full mask / MEC upload can kernel-panic macOS** — default is RLC-only now |
+| **Next** | `--boot-stage=fw-rlc` → `fw-cp` → `fw-mec` → `kiq` (no doorbell) → `kiq-map` |
+| **Safe** | `--probe`, `--selftest`, `--boot-stage=atom`, `--boot-stage=pre-fw`, `--boot-stage=fw-rlc` |
 
 ---
 
@@ -78,6 +79,119 @@ val = _u32(bios, off) if off + 4 <= len(bios) else 0
 ### VBIOS parser additions (supporting ATOM, from NootedRed + linux headers)
 
 | Function | Purpose |
+|----------|---------|
+| `check_atom_bios()` | `0xAA55` + `ATOM`/`MOTA` magic |
+| `mdt_offset()` / `MDT_IDX_*` | Master data table lookup (`VRAM_INFO=0x1C`, etc.) |
+| `parse_firmware_info()` | `main_call_parser`, `bios_scratch_reg_start` |
+| `parse_vram_info()` | GDDR5 size, channels, `mc_phyinit_off` from ROM |
+| `atom_info()` | Extended dump when `DEBUG=1` |
+
+### VRAM data path dead after training (BAR0 / MM_INDEX)
+
+Even with `trained=True`, CPU cannot read/write VRAM:
+
+| Path | Result |
+|------|--------|
+| BAR0 | constant garbage per session (`0x36e94e32`, `0xdbaeea31`, …) — writes ignored |
+| MM_INDEX | same constant at all offsets |
+| SMC `LoadUcodes` | times out — SMC DMA-reads TOC from VRAM MC addresses |
+
+**Workaround:** GART sysmem for compute buffers + **direct MMIO** firmware upload (no SMC DMA).
+
+### 2026-07-08 evening — direct MMIO + KIQ/KCQ port (in progress)
+
+**Done in code** (`ref/linux`):
+
+- `load_ip_firmware_direct()` — TrustOS-style MMIO ucode upload (RLC/PFP/CE/ME/MEC/SDMA)
+- `ViMqd` + `mqd_init_vi` / `mqd_commit_vi` from `gfx_v8_0.c` + `vi_structs.h`
+- KIQ at `me=1, pipe=1, queue=0` (KCQ uses `pipe=0`) per `amdgpu_gfx_kiq_acquire`
+- **SRBM bug fixed:** `srbm_select` had wrong `SRBM_GFX_CNTL` field layout (`vi.c` uses pipe@0, me@2, vmid@4, queue@8 — we had them scrambled)
+
+**Last HW session before macOS kernel panic:**
+
+- `CP_MEC_CNTL=0` (MEC unhalted) but `CP_HQD_ACTIVE=0` for both KIQ and KCQ
+- Likely cause: wrong SRBM routing (now fixed in code, **not yet verified**)
+
+**Crash post-mortem (2026-07-08 PM #1):** wrong `srbm_select` + KIQ doorbell → kernel panic.
+
+**Crash post-mortem (2026-07-08 PM #3):** `kiq-map` re-uploaded full MEC (~26s) then rang KIQ doorbell → kernel panic. Linux `gfx_v8_0_kcq_resume` order: KCQ MQD in memory only → `set_mec_doorbell_range` → `kiq_kcq_enable` → `amdgpu_ring_commit` (flush + doorbell). Fixes:
+
+| Issue | Fix |
+|-------|-----|
+| `kiq-map` re-uploads firmware | **`skip_fw=True`** if `compute_fw_loaded()` (ME1 already running) |
+| Doorbell without flush/settle | `_ring_commit`: HDP flush, `sysmem_dma_flush`, `mmio_settle`, drain before/after doorbell |
+| Wrong MEC doorbell range upper | `DOORBELL_MEC_RING7=0x17` not `MEC_RING0+8` |
+| Duplicate `enable_compute` | Removed from `_boot_stage_kiq` when using full fw path |
+
+Linux VI path: `gfx_v7_0_cp_gfx_load_microcode` (PFP/CE/ME, halt via `CP_ME_CNTL`), `gfx_v7_0_cp_compute_load_microcode` (MEC), `cik_sdma_load_microcode` (SDMA halt first). SMC `LoadUcodes` still preferred when BAR0 works — splits MEC JT as separate TOC entries (`amdgpu_cgs.c`).
+
+### Staged verification plan (do NOT skip steps)
+
+```bash
+# 1. Safe — confirm eGPU back after replug
+python3 add.py --probe
+
+# 2. ATOM only (~5k MMIO)
+python3 add.py --boot-stage=atom
+
+# 3. RLC only (~4k MMIO) — safest firmware probe
+python3 add.py --boot-stage=fw-rlc
+
+# 4. + PFP/CE/ME (~12k MMIO)
+python3 add.py --boot-stage=fw-cp
+
+# 5. + MEC upload only — stay halted (~15s with settle pauses)
+AMD_MMIO_DRAIN_EVERY=32 python3 add.py --boot-stage=fw-mec
+
+# 6. Settle + unhalt ME1 (separate step — if crash, it was upload not unhalt)
+python3 add.py --boot-stage=fw-start
+
+# 7. KIQ MQD only — no doorbell
+python3 add.py --boot-stage=kiq
+
+# 7. KIQ + MAP_QUEUES doorbell
+AMD_BOOT_KIQ_MAP=1 python3 add.py --boot-stage=kiq-map
+
+# 8. Full vector-add
+AMD_BOOT_FULL=1 python3 add.py
+```
+
+---
+
+## Historical: VRAM Not Trained blocker (resolved 2026-07-08)
+
+Layer 1 ATOM `asic_init` was stuck due to two `atom_replay.py` interpreter bugs (not hardware). Fixed — see **Solved: ATOM VRAM training** above. Old "Path A / Path B" Linux golden trace was unnecessary.
+
+---
+
+## ⚠️ STOP — Safety
+
+**Repeated crashes** — USB4 drop (replug) or **full macOS kernel panic** (reboot).
+
+| Command | Safe? |
+|---------|-------|
+| `--probe`, `--selftest` | ✅ |
+| `--boot-stage=atom`, `--boot-stage=pre-fw` | ⚠️ low–medium |
+| `--boot-stage=fw-direct` | ⚠️ high MMIO volume |
+| `--boot-stage=kiq` | ⚠️ high |
+| **`add.py` default** | ❌ **blocked** — requires `AMD_BOOT_FULL=1` |
+| `AMD_BOOT_LOADUCODES_UNTRAINED=1` | ❌ never |
+
+---
+
+## Latest Session (2026-07-08) — Docs + VBIOS parser
+
+### Research conclusions
+
+| Topic | Verdict |
+|-------|---------|
+| **ChefKiss NootedRed / NootRX** | No VRAM training — useful `ATOMBIOS.hpp` parsers only |
+| **TrustOS** | SDMA milestone assumes VBIOS already POST'd on x86 |
+| **Aitbytes VFIO** | Same `1002:67DF`; PCI rescan workaround |
+
+### Code — `atom_replay.py` (from NootedRed + linux headers)
+
+| Addition | Purpose |
 |----------|---------|
 | `check_atom_bios()` | `0xAA55` + `ATOM`/`MOTA` magic |
 | `mdt_offset()` / `MDT_IDX_*` | Master data table lookup (`VRAM_INFO=0x1C`, etc.) |
@@ -328,7 +442,10 @@ python3 diag_bar0.py                    # BAR0 diagnosis
 | `AMD_BOOT_SYSMEM_FLUSH` | `1` | `msync` before SMC DMA read |
 | `AMD_BOOT_SMC_UPLOAD` | `segmented` | SMC fw upload mode |
 | `AMD_BOOT_SMC_FLUSH_READ` | `0` | Skip risky post-upload SMC RAM read |
-| `AMD_MMIO_DRAIN_EVERY` | `128` | Drain TinyGPU MMIO queue |
+| `AMD_BOOT_FW_WRITE_PAUSE_MS` | `8` (MEC) | ms sleep every drain during large upload |
+| `AMD_MMIO_SETTLE_ROUNDS` | `30` | heavy settle loops before unhalt |
+| `AMD_MMIO_SETTLE_MS` | `100` | ms per settle round |
+| `AMD_BOOT_MEC2_HALT` | `1` | keep MEC2 halted (ME1 only) |
 | `AMD_BOOT_VBIOS_FILE` | — | Path to `rx570.rom` |
 | `AMD_ATOM_JUMP_BAIL` | `0` | `1` = fake-complete ATOM (obsolete now) |
 | `DEBUG` | `0` | Verbose logging |

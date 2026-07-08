@@ -27,14 +27,43 @@ mmSRBM_GFX_CNTL = 0x391
 mmGRBM_STATUS = 0x2004
 mmSRBM_STATUS = 0x0e50
 mmSRBM_STATUS = 0x0e50
-mmCP_ME_CNTL = 0x2086
+mmCP_ME_CNTL = 0x21b6
 mmCP_MEC_CNTL = 0x208d
 mmCP_HQD_ACTIVE = 0x3247
 mmCP_PQ_STATUS = 0x2147
 mmCP_MEC_DOORBELL_RANGE_LOWER = 0x2149
 mmCP_MEC_DOORBELL_RANGE_UPPER = 0x214a
-mmRLC_CNTL = 0x21c0
-mmRLC_CP_SCHEDULERS = 0x21c1
+mmRLC_CNTL = 0xec00
+mmRLC_CP_SCHEDULERS = 0xecaa
+mmGRBM_SOFT_RESET = 0x2008
+mmCP_PFP_UCODE_ADDR = 0xf814
+mmCP_PFP_UCODE_DATA = 0xf815
+mmCP_ME_RAM_WADDR = 0xf816
+mmCP_ME_RAM_DATA = 0xf817
+mmCP_CE_UCODE_ADDR = 0xf818
+mmCP_CE_UCODE_DATA = 0xf819
+mmCP_MEC_ME1_UCODE_ADDR = 0xf81a
+mmCP_MEC_ME1_UCODE_DATA = 0xf81b
+mmCP_MEC_ME2_UCODE_ADDR = 0xf81c
+mmCP_MEC_ME2_UCODE_DATA = 0xf81d
+mmRLC_GPM_UCODE_ADDR = 0xf83c
+mmRLC_GPM_UCODE_DATA = 0xf83d
+mmSDMA0_UCODE_ADDR = 0x3400
+mmSDMA0_UCODE_DATA = 0x3401
+mmSDMA0_F32_CNTL = 0x3412
+mmSDMA1_UCODE_ADDR = 0x3600
+mmSDMA1_UCODE_DATA = 0x3601
+mmSDMA1_F32_CNTL = 0x3612
+SDMA1_REG_OFFSET = 0x200
+
+CP_ME_CNTL_HALT = 0x01000000 | 0x04000000 | 0x10000000  # CE|PFP|ME
+CP_MEC_CNTL_HALT = 0x40000000 | 0x10000000  # ME1|ME2
+CP_MEC_ME1_HALT = 0x40000000
+CP_MEC_ME2_HALT = 0x10000000
+CP_MEC_ME1_ONLY = CP_MEC_ME2_HALT  # ME1 run, ME2 stay halted (TrustOS: MEC2 VM faults)
+GRBM_SOFT_RESET_RLC = 0x4
+RLC_CNTL_ENABLE = 0x1
+SDMA_F32_CNTL_HALT = 0x1
 mmCONFIG_MEMSIZE = 0x150a
 mmMC_VM_FB_LOCATION = 0x809
 mmMC_VM_SYSTEM_APERTURE_LOW_ADDR = 0x80d
@@ -112,8 +141,10 @@ UCODE_ID_CP_MEC_MASK = 0x00000040
 UCODE_ID_CP_MEC_JT1_MASK = 0x00000080
 UCODE_ID_CP_MEC_JT2_MASK = 0x00000100
 UCODE_ID_RLC_G_MASK = 0x00000400
-FW_TO_LOAD = (UCODE_ID_RLC_G_MASK | UCODE_ID_SDMA0_MASK | UCODE_ID_SDMA1_MASK |
-              UCODE_ID_CP_CE_MASK | UCODE_ID_CP_ME_MASK | UCODE_ID_CP_PFP_MASK | UCODE_ID_CP_MEC_MASK)
+FW_RLC_ONLY = UCODE_ID_RLC_G_MASK
+FW_CP_GFX_MASK = (UCODE_ID_CP_CE_MASK | UCODE_ID_CP_PFP_MASK | UCODE_ID_CP_ME_MASK)
+FW_COMPUTE_MIN = (FW_RLC_ONLY | FW_CP_GFX_MASK | UCODE_ID_CP_MEC_MASK)
+FW_TO_LOAD = (FW_COMPUTE_MIN | UCODE_ID_SDMA0_MASK | UCODE_ID_SDMA1_MASK)
 
 SMU_FW_BUF_SIZE = 200 * 4096
 SMU_HDR_BUF_SIZE = 4096
@@ -141,8 +172,13 @@ SMU_MODE_PROT = 0x10000
 
 DOORBELL_KIQ = 0x0
 DOORBELL_MEC_RING0 = 0x10
+DOORBELL_MEC_RING7 = 0x17  # amdgpu_doorbell.h — RANGE_UPPER uses ring7, not ring0+8
+# KIQ shares MEC1 with KCQ but uses pipe=1 (KCQ uses pipe=0) — amdgpu_gfx_kiq_acquire
+KIQ_ME, KIQ_PIPE, KIQ_QUEUE = 1, 1, 0
 GFX8_MEC_HPD_SIZE = 4096
 RING_SIZE = 0x10000
+# gfx_v8_0_ring_funcs_kiq/compute: align_mask=0xff (256-dword ring commit)
+VI_RING_ALIGN_MASK = 0xff
 PACKET3_MAP_QUEUES = 0xA2
 PACKET3_SET_RESOURCES = 0xA1
 PKT_TYPE3 = 3
@@ -313,6 +349,23 @@ class PolarisBoot:
     self.wreg(mmSMC_IND_INDEX_11, addr)
     self.rreg(mmSMC_IND_DATA_11)
 
+  def mmio_settle(self, label: str = "settle", heavy: bool = False):
+    """USB4/TinyGPU: MMIO writes are queued; wait for backlog before unhalt."""
+    if heavy:
+      rounds = int(os.environ.get("AMD_MMIO_SETTLE_ROUNDS", "30"))
+      pause_ms = int(os.environ.get("AMD_MMIO_SETTLE_MS", "100"))
+    else:
+      rounds = int(os.environ.get("AMD_MMIO_SETTLE_ROUNDS_LIGHT", "5"))
+      pause_ms = int(os.environ.get("AMD_MMIO_SETTLE_MS_LIGHT", "50"))
+    for i in range(rounds):
+      self.mmio_sync_safe()
+      if i % 5 == 0:
+        self._check_pci(f"{label} {i}/{rounds}")
+      if pause_ms:
+        time.sleep(pause_ms / 1000.0)
+    if int(os.environ.get("DEBUG", "0")):
+      print(f"polaris: mmio_settle {label} rounds={rounds} pause_ms={pause_ms}", flush=True)
+
   def mmio_sync_safe(self):
     with contextlib.suppress(Exception):
       self.dev.pci.drain_mmio(bar=5, reg=mmGRBM_STATUS)
@@ -338,7 +391,40 @@ class PolarisBoot:
     self.smc_wreg(reg, (old & ~(mask << shift)) | ((val & mask) << shift))
 
   def srbm_select(self, me=0, pipe=0, queue=0, vmid=0):
-    self.wreg(mmSRBM_GFX_CNTL, (queue & 7) | ((me & 3) << 4) | ((pipe & 3) << 8) | ((vmid & 0xf) << 16))
+    """vi_srbm_select — oss_3_0_sh_mask.h SRBM_GFX_CNTL field layout."""
+    val = ((pipe & 3) << 0) | ((me & 3) << 2) | ((vmid & 0xf) << 4) | ((queue & 7) << 8)
+    self.wreg(mmSRBM_GFX_CNTL, val)
+
+  def read_hqd_active(self, me=0, pipe=0, queue=0, vmid=0) -> int:
+    self.srbm_select(me, pipe, queue, vmid)
+    val = self.rreg(mmCP_HQD_ACTIVE)
+    self.srbm_select(0, 0, 0, 0)
+    return val
+
+  def boot_through_fw_direct(self, fw_mask: int | None = None, unhalt: bool | None = None):
+    """ATOM → SMC → MC → GART → direct MMIO firmware (no compute/KIQ)."""
+    from atom_replay import run_asic_init_if_needed, vram_training_ok
+    if fw_mask is None:
+      fw_mask = int(os.environ.get("AMD_BOOT_FW_MASK", str(FW_RLC_ONLY)), 0)
+    self.vi_common_init()
+    self.enable_vbios_rom()
+    run_asic_init_if_needed(self)
+    if not vram_training_ok(self):
+      self.mc_program_light()
+      with contextlib.suppress(RuntimeError):
+        self.load_mc_firmware()
+    self.gmc_sw_init()
+    self.start_smc()
+    self.process_smc_firmware_header()
+    self.mc_program()
+    with contextlib.suppress(RuntimeError):
+      self.load_mc_firmware()
+    if self.gart_pte_mem is None:
+      self.gart_enable()
+    if self.smc_running():
+      self.load_ip_firmware_direct(fw_mask, unhalt=unhalt)
+    else:
+      raise RuntimeError("boot_through_fw_direct: SMC not running")
 
 
   def fw(self, name: str) -> bytes:
@@ -1200,6 +1286,177 @@ class PolarisBoot:
     if int(os.environ.get("DEBUG", "0")):
       print("polaris: sysmem_dma_flush fw_buf", flush=True)
 
+  def alloc_gtt_buffer(self, size: int, align: int = PAGE_SIZE) -> tuple[int, object, list[int]]:
+    """Allocate host sysmem, map into GART, return (gpu_va, mem, paddrs)."""
+    nbytes = round_up(size, align)
+    mem, paddrs, _ = self.alloc_sysmem_buffer(nbytes, contiguous=True)
+    if not paddrs:
+      raise RuntimeError("alloc_gtt_buffer: no paddrs from alloc_sysmem")
+    gpu_va = self.map_sysmem_gpu(paddrs, nbytes)
+    from add import sysmem_dma_flush
+    sysmem_dma_flush(mem, nbytes)
+    return gpu_va, mem, paddrs
+
+  def cp_gfx_enable(self, enable: bool):
+    tmp = self.rreg(mmCP_ME_CNTL)
+    if enable:
+      tmp &= ~CP_ME_CNTL_HALT
+    else:
+      tmp |= CP_ME_CNTL_HALT
+    self.wreg(mmCP_ME_CNTL, tmp)
+    time.sleep(0.05)
+
+  def cp_compute_enable(self, enable: bool, me1_only: bool | None = None):
+    if me1_only is None:
+      me1_only = os.environ.get("AMD_BOOT_MEC2_HALT", "1") == "1"
+    if enable:
+      self.mmio_settle("pre-mec-unhalt", heavy=True)
+      self.wreg(mmCP_MEC_CNTL, CP_MEC_ME1_ONLY if me1_only else 0)
+    else:
+      self.wreg(mmCP_MEC_CNTL, CP_MEC_CNTL_HALT)
+    time.sleep(0.05)
+
+  def rlc_stop(self):
+    tmp = self.rreg(mmRLC_CNTL) & ~RLC_CNTL_ENABLE
+    self.wreg(mmRLC_CNTL, tmp)
+    time.sleep(0.05)
+
+  def rlc_start(self):
+    tmp = self.rreg(mmRLC_CNTL) | RLC_CNTL_ENABLE
+    self.wreg(mmRLC_CNTL, tmp)
+    time.sleep(0.05)
+
+  def rlc_reset(self):
+    tmp = self.rreg(mmGRBM_SOFT_RESET) | GRBM_SOFT_RESET_RLC
+    self.wreg(mmGRBM_SOFT_RESET, tmp)
+    time.sleep(0.05)
+    tmp = self.rreg(mmGRBM_SOFT_RESET) & ~GRBM_SOFT_RESET_RLC
+    self.wreg(mmGRBM_SOFT_RESET, tmp)
+    time.sleep(0.05)
+
+  def sdma_enable(self, enable: bool):
+    for off in (0, SDMA1_REG_OFFSET):
+      reg = mmSDMA0_F32_CNTL + off
+      tmp = self.rreg(reg)
+      if enable:
+        tmp &= ~SDMA_F32_CNTL_HALT
+      else:
+        tmp |= SDMA_F32_CNTL_HALT
+      self.wreg(reg, tmp)
+    time.sleep(0.05)
+
+  def _fw_ucode_words(self, blob: bytes) -> tuple[list[int], int]:
+    ucode_off, ucode_sz = parse_common_fw(blob)
+    version = _le32(blob, 16)  # amdgpu_firmware_header::ucode_version (gfx_v7_0.c)
+    words = [_le32(blob, ucode_off + i) for i in range(0, ucode_sz, 4)]
+    return words, version
+
+  def _mmio_drain_every(self, nwords: int) -> int:
+    """USB4 TinyGPU: fire-and-forget MMIO needs periodic drain; large blobs need tighter spacing."""
+    env = os.environ.get("AMD_MMIO_DRAIN_EVERY")
+    if env is not None:
+      return max(0, int(env))
+    if nwords > 32000:
+      return 32
+    if nwords > 8000:
+      return 64
+    return 128
+
+  def _mmio_load_ucode(self, addr_reg: int, data_reg: int, words: list[int], version: int,
+                       final_addr: int | None = None, label: str = "ucode"):
+    drain = self._mmio_drain_every(len(words))
+    pci_every = max(0, int(os.environ.get("AMD_BOOT_FW_PCI_EVERY", "4096")))
+    large = len(words) > 32000
+    pause_ms = max(0, int(os.environ.get("AMD_BOOT_FW_WRITE_PAUSE_MS", "8" if large else "0")))
+    self.wreg(addr_reg, 0)
+    self.mmio_sync_safe()
+    for i, w in enumerate(words):
+      self.wreg(data_reg, w)
+      if drain and i and (i % drain) == 0:
+        self.mmio_sync_safe()
+        if pause_ms:
+          time.sleep(pause_ms / 1000.0)
+      if pci_every and i and (i % pci_every) == 0:
+        self._check_pci(f"direct {label} {i}/{len(words)}")
+    done_addr = version if final_addr is None else final_addr
+    self.wreg(addr_reg, done_addr)
+    self.mmio_sync_safe()
+    self.mmio_settle(f"post-{label}", heavy=large)
+    self._check_pci(f"direct {label} done")
+
+  def load_ip_firmware_direct(self, fw_mask: int | None = None, unhalt: bool | None = None):
+    """gfx_v7_0/cik_sdma direct MMIO ucode upload — bypasses SMC LoadUcodes.
+
+    Linux refs: gfx_v7_0_cp_gfx_load_microcode, gfx_v7_0_cp_compute_load_microcode
+    (MEC final ADDR=0), cik_sdma_load_microcode (SDMA ADDR=version).
+    """
+    if fw_mask is None:
+      fw_mask = int(os.environ.get("AMD_BOOT_FW_MASK", str(FW_RLC_ONLY)), 0)
+    if unhalt is None:
+      unhalt = os.environ.get("AMD_BOOT_FW_UNHALT", "1") == "1"
+    pause_ms = max(0, int(os.environ.get("AMD_BOOT_FW_PAUSE_MS", "50")))
+    want = {
+      UCODE_ID_RLC_G: ("polaris10_rlc.bin", mmRLC_GPM_UCODE_ADDR, mmRLC_GPM_UCODE_DATA,
+                       UCODE_ID_RLC_G_MASK, None),
+      UCODE_ID_CP_PFP: ("polaris10_pfp.bin", mmCP_PFP_UCODE_ADDR, mmCP_PFP_UCODE_DATA,
+                        UCODE_ID_CP_PFP_MASK, None),
+      UCODE_ID_CP_CE: ("polaris10_ce.bin", mmCP_CE_UCODE_ADDR, mmCP_CE_UCODE_DATA,
+                       UCODE_ID_CP_CE_MASK, None),
+      UCODE_ID_CP_ME: ("polaris10_me.bin", mmCP_ME_RAM_WADDR, mmCP_ME_RAM_DATA,
+                       UCODE_ID_CP_ME_MASK, None),
+      UCODE_ID_CP_MEC: ("polaris10_mec.bin", mmCP_MEC_ME1_UCODE_ADDR, mmCP_MEC_ME1_UCODE_DATA,
+                        UCODE_ID_CP_MEC_MASK, 0),  # gfx_v7_0_cp_compute_load_microcode
+      UCODE_ID_SDMA0: ("polaris10_sdma.bin", mmSDMA0_UCODE_ADDR, mmSDMA0_UCODE_DATA,
+                       UCODE_ID_SDMA0_MASK, None),
+      UCODE_ID_SDMA1: ("polaris10_sdma1.bin", mmSDMA1_UCODE_ADDR, mmSDMA1_UCODE_DATA,
+                       UCODE_ID_SDMA1_MASK, None),
+    }
+    self.rlc_stop()
+    self.cp_gfx_enable(False)
+    self.cp_compute_enable(False)
+    self.sdma_enable(False)
+    self.rlc_reset()
+    loaded = []
+    for ucode_id, (name, addr_reg, data_reg, bit, final_addr) in want.items():
+      if not (fw_mask & bit):
+        continue
+      blob = self.fw(name)
+      words, version = self._fw_ucode_words(blob)
+      if int(os.environ.get("DEBUG", "0")):
+        print(f"polaris: direct ucode {name} words={len(words)} ver={version:#x} "
+              f"final_addr={(final_addr if final_addr is not None else version):#x}", flush=True)
+      t0 = time.time()
+      self._mmio_load_ucode(addr_reg, data_reg, words, version, final_addr=final_addr, label=name)
+      loaded.append(name)
+      if int(os.environ.get("DEBUG", "0")):
+        print(f"polaris: direct {name} ok in {time.time()-t0:.1f}s", flush=True)
+      if pause_ms:
+        time.sleep(pause_ms / 1000.0)
+    if fw_mask & UCODE_ID_RLC_G_MASK:
+      self.rlc_start()
+    if unhalt:
+      if fw_mask & (FW_CP_GFX_MASK | UCODE_ID_CP_MEC_MASK):
+        self.cp_gfx_enable(True)
+      if fw_mask & UCODE_ID_CP_MEC_MASK:
+        self.cp_compute_enable(True)
+      if fw_mask & (UCODE_ID_SDMA0_MASK | UCODE_ID_SDMA1_MASK):
+        self.sdma_enable(True)
+    print(f"polaris: direct MMIO firmware loaded mask={fw_mask:#x} "
+          f"unhalt={unhalt} ({', '.join(loaded) or 'none'})", flush=True)
+
+  def unhalt_loaded_firmware(self, fw_mask: int | None = None):
+    """Unhalt CP/SDMA after upload+settle (separate from upload for USB4 safety)."""
+    if fw_mask is None:
+      fw_mask = int(os.environ.get("AMD_BOOT_FW_MASK", str(FW_COMPUTE_MIN)), 0)
+    if fw_mask & (FW_CP_GFX_MASK | UCODE_ID_CP_MEC_MASK):
+      self.cp_gfx_enable(True)
+    if fw_mask & UCODE_ID_CP_MEC_MASK:
+      self.cp_compute_enable(True)
+    if fw_mask & (UCODE_ID_SDMA0_MASK | UCODE_ID_SDMA1_MASK):
+      self.sdma_enable(True)
+    print(f"polaris: firmware unhalt mask={fw_mask:#x} "
+          f"CP_MEC_CNTL={self.rreg(mmCP_MEC_CNTL):#x}", flush=True)
+
   def load_ip_firmware_prereqs(self) -> tuple[bool, str, bool, bool]:
     """Whether LoadUcodes is safe: Linux needs a CPU-writable VRAM path (BAR0 or
     MM_INDEX) for the SMC TOC/header/scratch. On this TinyGPU/USB4 eGPU the VRAM
@@ -1411,10 +1668,43 @@ class PolarisBoot:
       raise RuntimeError(
         f"IP firmware load timeout (RESP={resp:#x} UcodeLoadStatus={status_s} want {fw_mask:#x}) {self.smc_diag()}")
 
-  def enable_compute(self):
-    self.wreg(mmCP_MEC_CNTL, 0)
+  def kiq_setting(self, me: int, pipe: int, queue: int):
+    """gfx_v8_0_kiq_setting — tell RLC which queue is KIQ."""
+    tmp = self.rreg(mmRLC_CP_SCHEDULERS) & 0xffffff00
+    tmp |= (me << 5) | (pipe << 3) | queue
+    self.wreg(mmRLC_CP_SCHEDULERS, tmp | 0x80)
+
+  def set_mec_doorbell_range(self):
+    """gfx_v8_0_set_mec_doorbell_range (Polaris10 > Tonga)."""
     self.wreg(mmCP_MEC_DOORBELL_RANGE_LOWER, DOORBELL_KIQ << 2)
-    self.wreg(mmCP_MEC_DOORBELL_RANGE_UPPER, (DOORBELL_MEC_RING0 + 8) << 2)
+    self.wreg(mmCP_MEC_DOORBELL_RANGE_UPPER, DOORBELL_MEC_RING7 << 2)
+    self.wreg(mmCP_PQ_STATUS, self.rreg(mmCP_PQ_STATUS) | CP_PQ_STATUS_DOORBELL_ENABLE_MASK)
+    self.mmio_sync_safe()
+
+  def compute_fw_loaded(self) -> bool:
+    """ME1 running with SMC up — skip re-upload on kiq-map if prior stage left GPU hot."""
+    if not self.smc_running():
+      return False
+    mec = self.rreg(mmCP_MEC_CNTL)
+    return (mec & CP_MEC_ME1_HALT) == 0
+
+  def boot_minimal_for_compute(self):
+    """GART + doorbells when firmware already resident (GPU state persists across CLI invocations)."""
+    self.vi_common_init()
+    self.gmc_sw_init()
+    if self.gart_pte_mem is None:
+      self.gart_enable()
+    if not self.compute_fw_loaded():
+      raise RuntimeError(
+        "compute firmware not loaded — run --boot-stage=fw-mec && --boot-stage=fw-start first")
+    self.set_mec_doorbell_range()
+    pq = self.rreg(mmCP_PQ_STATUS)
+    self.wreg(mmCP_PQ_STATUS, pq | (1 << 28))
+    self.mmio_sync_safe()
+
+  def enable_compute(self):
+    self.cp_compute_enable(True)
+    self.set_mec_doorbell_range()
     pq = self.rreg(mmCP_PQ_STATUS)
     self.wreg(mmCP_PQ_STATUS, pq | (1 << 28))
     self.mmio_sync_safe()
@@ -1524,6 +1814,8 @@ class PolarisBoot:
     need_gart = fw_layout in ("gtt", "hybrid", "agp") or (fw_layout == "auto" and not bar0_ok)
     if need_gart:
       self.gart_enable()
+    fw_mask = int(os.environ.get("AMD_BOOT_FW_MASK", str(FW_TO_LOAD)), 0)
+    fw_direct = os.environ.get("AMD_BOOT_FW_DIRECT", "auto")
     if self.smc_running():
       force = os.environ.get("AMD_BOOT_LOADUCODES_UNTRAINED", "0") == "1"
       if fw_allowed:
@@ -1531,6 +1823,9 @@ class PolarisBoot:
       elif force:
         print("polaris: WARNING — AMD_BOOT_LOADUCODES_UNTRAINED=1 (crash risk)", flush=True)
         self.load_ip_firmware()
+      elif fw_direct != "0":
+        print(f"polaris: LoadUcodes skipped — direct MMIO upload ({fw_reason})", flush=True)
+        self.load_ip_firmware_direct(fw_mask)
       else:
         print(f"polaris: skip LoadUcodes ({fw_reason})", flush=True)
     try:
@@ -1548,16 +1843,173 @@ class PolarisBoot:
       self.gart_enable()
     self.enable_compute()
     self.init_compute_queue()
-    if not self.dev.gpu_ready() and self.rreg(mmCP_MEC_CNTL) == 0x50000000:
+    if not self.dev.gpu_ready() and self.rreg(mmCP_MEC_CNTL) == CP_MEC_CNTL_HALT:
       if not vram_training_ok(self):
         raise RuntimeError(
-          "Polaris boot stopped safely: VRAM not trained — LoadUcodes skipped. "
-          "Need ATOM training (MEMSIZE>=128, MISC0|0x80) or working MM_INDEX. "
-          "Do not set AMD_BOOT_LOADUCODES_UNTRAINED=1 unless VRAM path works.")
+          "Polaris boot stopped safely: VRAM not trained — firmware not loaded. "
+          "Need ATOM training (MEMSIZE>=128, MISC0|0x80) or AMD_BOOT_FW_DIRECT=1.")
       raise RuntimeError(
         f"Polaris boot incomplete: SMC={self.smc_running()} "
-        f"CP_HQD_ACTIVE={self.rreg(mmCP_HQD_ACTIVE):#x}"
-      )
+        f"CP_MEC_CNTL={self.rreg(mmCP_MEC_CNTL):#x} CP_HQD_ACTIVE={self.rreg(mmCP_HQD_ACTIVE):#x}")
+
+
+mmCP_PQ_WPTR_POLL_CNTL = 0x3083
+mmCP_HQD_PQ_RPTR = 0x324f
+mmCP_HQD_IB_BASE_ADDR_LO = 0x3257
+mmCP_HQD_QUANTUM = 0x324c
+mmCP_HQD_EOP_RPTR = 0x326d
+mmCP_HQD_EOP_WPTR = 0x326e
+mmCP_HQD_EOP_EVENTS = 0x326f
+mmCP_HQD_ERROR = 0x3278
+mmCP_HQD_EOP_WPTR_MEM = 0x3279
+mmCP_HQD_EOP_DONES = 0x327a
+
+# gfx_8_0_sh_mask.h field helpers
+def _reg_field(val: int, mask: int, shift: int, fval: int) -> int:
+  return (val & ~mask) | ((fval << shift) & mask)
+
+CP_HQD_PQ_CONTROL_QUEUE_SIZE_MASK = 0x3f
+CP_HQD_PQ_CONTROL_RPTR_BLOCK_SIZE_MASK = 0x3f00
+CP_HQD_PQ_CONTROL_UNORD_DISPATCH_MASK = 0x10000000
+CP_HQD_PQ_CONTROL_ROQ_PQ_IB_FLIP_MASK = 0x20000000
+CP_HQD_PQ_CONTROL_PRIV_STATE_MASK = 0x40000000
+CP_HQD_PQ_CONTROL_KMD_QUEUE_MASK = 0x80000000
+CP_HQD_PQ_DOORBELL_OFFSET_MASK = 0x7ffffc
+CP_HQD_PQ_DOORBELL_EN_MASK = 0x40000000
+CP_HQD_IB_CONTROL_MIN_IB_AVAIL_SIZE_MASK = 0x300000
+CP_HQD_IB_CONTROL_MTYPE_MASK = 0xc0000
+CP_HQD_IQ_TIMER_MTYPE_MASK = 0x3000000
+CP_HQD_CTX_SAVE_CONTROL_MTYPE_MASK = 0x3000000
+CP_HQD_PERSISTENT_STATE_PRELOAD_SIZE_MASK = 0xff
+CP_HQD_EOP_CONTROL_EOP_SIZE_MASK = 0xf000
+CP_HQD_QUANTUM_QUANTUM_EN_MASK = 0x1
+CP_HQD_QUANTUM_QUANTUM_SCALE_MASK = 0x6
+CP_HQD_QUANTUM_QUANTUM_DURATION_MASK = 0xfffffff0
+CP_MQD_CONTROL_VMID_MASK = 0xf
+CP_PQ_STATUS_DOORBELL_ENABLE_MASK = 0x2
+
+# vi_structs.h — vi_mqd_allocation dword count
+VI_MQD_ALLOC_DWORDS = 261
+MQD_HQD_WORD = 128  # cp_mqd_base_addr_lo
+
+# PACKET3_MAP_QUEUES field builders (amdgpu/vid.h, VI)
+def _map_queues_num_q(n: int) -> int: return n << 29
+def _map_queues_dbell(off: int) -> int: return off << 2
+def _map_queues_queue(q: int) -> int: return q << 26
+def _map_queues_pipe(p: int) -> int: return p << 29
+def _map_queues_me(m: int) -> int: return m << 31
+
+
+class ViMqd:
+  """struct vi_mqd_allocation in GPU memory (ref/linux vi_structs.h)."""
+
+  def __init__(self):
+    self.w = [0] * VI_MQD_ALLOC_DWORDS
+    self.w[257 + 2] = 0xffffffff  # dynamic_cu_mask
+    self.w[257 + 3] = 0xffffffff  # dynamic_rb_mask
+
+  def hqd(self, reg: int) -> int:
+    return self.w[MQD_HQD_WORD + (reg - mmCP_MQD_BASE_ADDR)]
+
+  def set_hqd(self, reg: int, val: int):
+    self.w[MQD_HQD_WORD + (reg - mmCP_MQD_BASE_ADDR)] = val & 0xffffffff
+
+  def to_bytes(self) -> bytes:
+    return struct.pack('<' + 'I' * VI_MQD_ALLOC_DWORDS, *self.w)
+
+
+def mqd_init_vi(boot: PolarisBoot, cq: 'ComputeQueue', is_kiq: bool) -> ViMqd:
+  """Port of gfx_v8_0_mqd_init (ref/linux gfx_v8_0.c)."""
+  m = ViMqd()
+  m.w[0] = 0xC0310800
+  m.w[11] = 1  # compute_pipelinestat_enable
+  for i in (23, 24, 26, 27):
+    m.w[i] = 0xffffffff  # static thread mgmt SE0-3
+  m.w[32] = 3  # compute_misc_reserved
+  cu_addr = cq.mqd_gpu + (257 + 2) * 4
+  m.w[126] = cu_addr & 0xffffffff
+  m.w[127] = (cu_addr >> 32) & 0xffffffff
+
+  boot.srbm_select(cq.me, cq.pipe, cq.queue, 0)
+  eop_base = cq.eop_gpu >> 8
+  m.set_hqd(mmCP_HQD_EOP_BASE_ADDR_LO, eop_base & 0xffffffff)
+  m.set_hqd(mmCP_HQD_EOP_BASE_ADDR_HI, (eop_base >> 32) & 0xffffffff)
+  eop_sz = order_base_2(GFX8_MEC_HPD_SIZE // 4) - 1
+  tmp = boot.rreg(mmCP_HQD_EOP_CONTROL)
+  tmp = _reg_field(tmp, CP_HQD_EOP_CONTROL_EOP_SIZE_MASK, 12, eop_sz)
+  m.set_hqd(mmCP_HQD_EOP_CONTROL, tmp)
+
+  dbell = _reg_field(0, CP_HQD_PQ_DOORBELL_OFFSET_MASK, 2, cq.doorbell_index)
+  dbell = _reg_field(dbell, CP_HQD_PQ_DOORBELL_EN_MASK, 30, 1)
+  m.set_hqd(mmCP_HQD_PQ_DOORBELL_CONTROL, dbell)
+
+  m.set_hqd(mmCP_MQD_BASE_ADDR, cq.mqd_gpu & 0xfffffffc)
+  m.set_hqd(mmCP_MQD_BASE_ADDR + 1, (cq.mqd_gpu >> 32) & 0xffffffff)
+  mqd_ctl = _reg_field(boot.rreg(mmCP_MQD_CONTROL), CP_MQD_CONTROL_VMID_MASK, 0, 0)
+  m.set_hqd(mmCP_MQD_CONTROL, mqd_ctl)
+
+  hqd_base = cq.ring_gpu >> 8
+  m.set_hqd(mmCP_HQD_PQ_BASE_LO, hqd_base & 0xffffffff)
+  m.set_hqd(mmCP_HQD_PQ_BASE_HI, (hqd_base >> 32) & 0xffffffff)
+
+  qsize = order_base_2(RING_SIZE // 4) - 1
+  rptr_blk = order_base_2(PAGE_SIZE // 4) - 1
+  tmp = boot.rreg(mmCP_HQD_PQ_CONTROL)
+  tmp = _reg_field(tmp, CP_HQD_PQ_CONTROL_QUEUE_SIZE_MASK, 0, qsize)
+  tmp = _reg_field(tmp, CP_HQD_PQ_CONTROL_RPTR_BLOCK_SIZE_MASK, 8, rptr_blk)
+  tmp = _reg_field(tmp, CP_HQD_PQ_CONTROL_UNORD_DISPATCH_MASK, 28, 0)
+  tmp = _reg_field(tmp, CP_HQD_PQ_CONTROL_ROQ_PQ_IB_FLIP_MASK, 29, 0)
+  tmp = _reg_field(tmp, CP_HQD_PQ_CONTROL_PRIV_STATE_MASK, 30, 1)
+  tmp = _reg_field(tmp, CP_HQD_PQ_CONTROL_KMD_QUEUE_MASK, 31, 1)
+  m.set_hqd(mmCP_HQD_PQ_CONTROL, tmp)
+
+  m.set_hqd(mmCP_HQD_PQ_RPTR_REPORT_ADDR_LO, cq.rptr_gpu & 0xfffffffc)
+  m.set_hqd(mmCP_HQD_PQ_RPTR_REPORT_ADDR_HI, (cq.rptr_gpu >> 32) & 0xffff)
+  m.set_hqd(mmCP_HQD_PQ_WPTR_POLL_ADDR_LO, cq.wptr_gpu & 0xfffffffc)
+  m.set_hqd(mmCP_HQD_PQ_WPTR_POLL_ADDR_HI, (cq.wptr_gpu >> 32) & 0xffff)
+  m.set_hqd(mmCP_HQD_PQ_WPTR, 0)
+  m.set_hqd(mmCP_HQD_PQ_RPTR, boot.rreg(mmCP_HQD_PQ_RPTR))
+  m.set_hqd(mmCP_HQD_VMID, 0)
+  m.set_hqd(mmCP_HQD_PERSISTENT_STATE,
+            _reg_field(boot.rreg(mmCP_HQD_PERSISTENT_STATE), CP_HQD_PERSISTENT_STATE_PRELOAD_SIZE_MASK, 0, 0x53))
+  tmp = boot.rreg(mmCP_HQD_IB_CONTROL)
+  tmp = _reg_field(tmp, CP_HQD_IB_CONTROL_MIN_IB_AVAIL_SIZE_MASK, 20, 3)
+  tmp = _reg_field(tmp, CP_HQD_IB_CONTROL_MTYPE_MASK, 16, 3)
+  m.set_hqd(mmCP_HQD_IB_CONTROL, tmp)
+  tmp = _reg_field(boot.rreg(mmCP_HQD_IQ_TIMER), CP_HQD_IQ_TIMER_MTYPE_MASK, 24, 3)
+  m.set_hqd(mmCP_HQD_IQ_TIMER, tmp)
+  tmp = _reg_field(boot.rreg(mmCP_HQD_CTX_SAVE_CONTROL), CP_HQD_CTX_SAVE_CONTROL_MTYPE_MASK, 24, 3)
+  m.set_hqd(mmCP_HQD_CTX_SAVE_CONTROL, tmp)
+  for reg in (mmCP_HQD_EOP_RPTR, mmCP_HQD_EOP_WPTR, mmCP_HQD_EOP_WPTR_MEM, mmCP_HQD_EOP_DONES):
+    m.set_hqd(reg, boot.rreg(reg))
+  for reg in (mmCP_HQD_EOP_EVENTS, mmCP_HQD_ERROR):
+    m.set_hqd(reg, boot.rreg(reg))
+  tmp = boot.rreg(mmCP_HQD_QUANTUM)
+  tmp = _reg_field(tmp, CP_HQD_QUANTUM_QUANTUM_EN_MASK, 0, 1)
+  tmp = _reg_field(tmp, CP_HQD_QUANTUM_QUANTUM_SCALE_MASK, 1, 1)
+  tmp = _reg_field(tmp, CP_HQD_QUANTUM_QUANTUM_DURATION_MASK, 4, 10)
+  m.set_hqd(mmCP_HQD_QUANTUM, tmp)
+  if is_kiq:
+    m.set_hqd(mmCP_HQD_ACTIVE, 1)
+  boot.srbm_select(0, 0, 0, 0)
+  return m
+
+
+def mqd_commit_vi(boot: PolarisBoot, cq: 'ComputeQueue', mqd: ViMqd):
+  """Port of gfx_v8_0_mqd_commit (ref/linux gfx_v8_0.c)."""
+  boot.srbm_select(cq.me, cq.pipe, cq.queue, 0)
+  boot.wreg(mmCP_PQ_WPTR_POLL_CNTL, boot.rreg(mmCP_PQ_WPTR_POLL_CNTL) & ~1)
+  for reg in range(mmCP_HQD_VMID, mmCP_HQD_EOP_CONTROL + 1):
+    boot.wreg(reg, mqd.hqd(reg))
+  boot.wreg(mmCP_HQD_EOP_RPTR, mqd.hqd(mmCP_HQD_EOP_RPTR))
+  boot.wreg(mmCP_HQD_EOP_WPTR, mqd.hqd(mmCP_HQD_EOP_WPTR))
+  boot.wreg(mmCP_HQD_EOP_WPTR_MEM, mqd.hqd(mmCP_HQD_EOP_WPTR_MEM))
+  for reg in range(mmCP_HQD_EOP_EVENTS, mmCP_HQD_ERROR + 1):
+    boot.wreg(reg, mqd.hqd(reg))
+  for reg in range(mmCP_MQD_BASE_ADDR, mmCP_HQD_ACTIVE + 1):
+    boot.wreg(reg, mqd.hqd(reg))
+  boot.srbm_select(0, 0, 0, 0)
+  boot.mmio_sync_safe()
 
 
 mmCP_HQD_PQ_BASE_LO = 0x324d
@@ -1569,12 +2021,13 @@ mmCP_HQD_PQ_WPTR_POLL_ADDR_HI = 0x3253
 mmCP_HQD_PQ_DOORBELL_CONTROL = 0x3254
 mmCP_HQD_PQ_WPTR = 0x3255
 mmCP_HQD_PQ_CONTROL = 0x3256
+mmCP_HQD_IB_BASE_ADDR_LO = 0x3257
 mmCP_HQD_IB_CONTROL = 0x325a
-mmCP_HQD_IQ_TIMER = 0x325c
-mmCP_HQD_CTX_SAVE_CONTROL = 0x3260
-mmCP_HQD_EOP_BASE_ADDR_LO = 0x3264
-mmCP_HQD_EOP_BASE_ADDR_HI = 0x3265
-mmCP_HQD_EOP_CONTROL = 0x3266
+mmCP_HQD_IQ_TIMER = 0x325b
+mmCP_HQD_CTX_SAVE_CONTROL = 0x3272
+mmCP_HQD_EOP_BASE_ADDR_LO = 0x326a
+mmCP_HQD_EOP_BASE_ADDR_HI = 0x326b
+mmCP_HQD_EOP_CONTROL = 0x326c
 mmCP_MQD_CONTROL = 0x3267
 mmCP_HQD_PERSISTENT_STATE = 0x3249
 
@@ -1587,102 +2040,170 @@ class ComputeQueue:
     self.dev = boot.dev
     self.me, self.pipe, self.queue = me, pipe, queue
     self.doorbell_index = doorbell_index
+    # Use GART/sysmem when PTE table is in host memory (TinyGPU eGPU path).
+    self._gtt = boot.gart_pte_sysmem is not None or not boot.probe_bar0_writes()
     self.ring_off = self.mqd_off = self.eop_off = self.wptr_off = 0
-    self.ring_gpu = self.mqd_gpu = self.eop_gpu = self.wptr_gpu = 0
+    self.ring_gpu = self.mqd_gpu = self.eop_gpu = self.wptr_gpu = self.rptr_gpu = 0
+    self.ring_mem = self.mqd_mem = self.eop_mem = self.wptr_mem = None
     self.wptr = 0
 
-  def _alloc_vram(self, size: int, align=0x1000) -> int:
-    return self.dev.alloc_vram(size, align)
+  def _alloc_buf(self, size: int, align=0x1000) -> tuple[int, object | None, int]:
+    if self._gtt:
+      gpu_va, mem, _ = self.boot.alloc_gtt_buffer(size, align)
+      return gpu_va, mem, 0
+    off = self.dev.alloc_vram(size, align)
+    return self.dev.vram_gpu_addr(off), None, off
 
-  def _write_ring(self, words: list[int]):
+  def _write_bytes(self, off_or_mem, data: bytes, mem=None):
+    if mem is not None:
+      mem[0:len(data)] = data
+      from add import sysmem_dma_flush
+      sysmem_dma_flush(mem, len(data))
+    else:
+      self.dev.upload(off_or_mem, data)
+
+  def _write_ring(self, words: list[int], offset_dwords: int = 0):
     data = struct.pack('<' + 'I' * len(words), *words)
-    self.dev.upload(self.ring_off, data)
+    byte_off = offset_dwords * 4
+    if self.ring_mem is not None:
+      self.ring_mem[byte_off:byte_off + len(data)] = data
+      from add import sysmem_dma_flush
+      sysmem_dma_flush(self.ring_mem, byte_off + len(data))
+    else:
+      self.dev.upload(self.ring_off + byte_off, data)
 
-  def _mqd_regs(self, ring_gpu: int, ring_size: int, mqd_gpu: int, eop_gpu: int, wptr_gpu: int,
-                doorbell_index: int, active: bool) -> dict[int, int]:
-    qsize = order_base_2(ring_size // 4) - 1
-    rptr_blk = order_base_2(1024) - 1
-    eop_size = order_base_2(GFX8_MEC_HPD_SIZE // 4) - 1
-    pq_ctl = (qsize << 0) | (rptr_blk << 8) | 0x80000 | 0x100000
-    ib_ctl = 0x30003
-    iq_timer = 0x30000
-    ctx_save = 0x30000
-    eop_ctl = eop_size << 12
-    mqd = {
-      mmCP_MQD_BASE_ADDR: mqd_gpu & 0xfffffffc,
-      mmCP_MQD_BASE_ADDR + 1: (mqd_gpu >> 32) & 0xffffffff,
-      mmCP_HQD_VMID: 0,
-      mmCP_HQD_PERSISTENT_STATE: 0x53,
-      mmCP_HQD_PQ_BASE_LO: (ring_gpu >> 8) & 0xffffffff,
-      mmCP_HQD_PQ_BASE_HI: ring_gpu >> 8 >> 32,
-      mmCP_HQD_PQ_RPTR_REPORT_ADDR_LO: wptr_gpu & 0xfffffffc,
-      mmCP_HQD_PQ_RPTR_REPORT_ADDR_HI: (wptr_gpu >> 32) & 0xffff,
-      mmCP_HQD_PQ_WPTR_POLL_ADDR_LO: wptr_gpu & 0xffffffff,
-      mmCP_HQD_PQ_WPTR_POLL_ADDR_HI: (wptr_gpu >> 32) & 0xffffffff,
-      mmCP_HQD_PQ_DOORBELL_CONTROL: (doorbell_index << 28) | 0x10000,
-      mmCP_HQD_PQ_WPTR: 0,
-      mmCP_HQD_PQ_CONTROL: pq_ctl,
-      mmCP_HQD_IB_CONTROL: ib_ctl,
-      mmCP_HQD_IQ_TIMER: iq_timer,
-      mmCP_HQD_CTX_SAVE_CONTROL: ctx_save,
-      mmCP_HQD_EOP_BASE_ADDR_LO: eop_gpu & 0xffffffff,
-      mmCP_HQD_EOP_BASE_ADDR_HI: (eop_gpu >> 32) & 0xffffffff,
-      mmCP_HQD_EOP_CONTROL: eop_ctl,
-      mmCP_MQD_CONTROL: 0x1 if active else 0,
-    }
-    return mqd
+  def _publish_wptr(self, wptr: int):
+    """gfx_v8_0_ring_set_wptr_compute: CPU shadow + doorbell."""
+    if self.wptr_mem is None:
+      return
+    chunk = struct.pack('<I', wptr & 0xffffffff)
+    self.wptr_mem[64:68] = chunk
+    from add import sysmem_dma_flush
+    sysmem_dma_flush(self.wptr_mem, 128)
 
-  def _mqd_commit(self, mqd: dict[int, int]):
-    self.boot.srbm_select(self.me, self.pipe, self.queue, 0)
-    self.boot.wreg(mmCP_PQ_WPTR_POLL_CNTL, 0)
-    for reg in range(mmCP_HQD_VMID, mmCP_HQD_EOP_CONTROL + 1):
-      if reg in mqd:
-        self.boot.wreg(reg, mqd[reg])
-    for reg in range(mmCP_HQD_EOP_CONTROL + 1, mmCP_HQD_ACTIVE + 1):
-      if reg in mqd:
-        self.boot.wreg(reg, mqd[reg])
-    self.boot.srbm_select(0, 0, 0, 0)
-    self.boot.mmio_sync()
+  def _upload_mqd(self, mqd: ViMqd):
+    data = mqd.to_bytes()
+    if self.mqd_mem is not None:
+      self._write_bytes(0, data, self.mqd_mem)
+    else:
+      self.dev.upload(self.mqd_off, data)
 
-  def _map_queues_pkt(self, target: 'ComputeQueue') -> list[int]:
+  def _kiq_map_queues_pkt(self, target: 'ComputeQueue') -> list[int]:
+    """gfx_v8_0_kiq_kcq_enable PM4 (ref/linux gfx_v8_0.c)."""
     w: list[int] = []
     w.append(pkt3(PACKET3_SET_RESOURCES, 6))
-    w.extend([0, 1, 0, 0, 0, 0, 0])
+    w.extend([0, 1, 0, 0, 0, 0, 0])  # queue_mask bit0 = KCQ ring0
     w.append(pkt3(PACKET3_MAP_QUEUES, 5))
-    w.append(0x20000000)
-    doorbell_me = 0 if target.me == 1 else 1
-    w.append((target.doorbell_index << 2) | (target.queue << 26) | (target.pipe << 29) | (doorbell_me << 31))
+    w.append(_map_queues_num_q(1))
+    me_bit = 0 if target.me == 1 else 1
+    w.append(_map_queues_dbell(target.doorbell_index) | _map_queues_queue(target.queue) |
+             _map_queues_pipe(target.pipe) | _map_queues_me(me_bit))
     w.append(target.mqd_gpu & 0xffffffff)
     w.append((target.mqd_gpu >> 32) & 0xffffffff)
     w.append(target.wptr_gpu & 0xffffffff)
     w.append((target.wptr_gpu >> 32) & 0xffffffff)
     return w
 
+  def _ring_commit(self, words: list[int], doorbell_index: int,
+                   align_mask: int = VI_RING_ALIGN_MASK):
+    """amdgpu_ring_commit: VI KIQ/KCQ rings pad to 256-dword boundary."""
+    w = list(words)
+    base = self.wptr
+    new_wptr = base + len(w)
+    pad = (align_mask + 1) - (new_wptr & align_mask)
+    pad &= align_mask
+    if pad:
+      w.extend([0x80000000] * pad)
+    self._write_ring(w, offset_dwords=base)
+    new_wptr = base + len(w)
+    boot = self.boot
+    boot.hdp_flush()
+    boot.hdp_invalidate()
+    for mem in (self.ring_mem, self.mqd_mem, self.eop_mem, self.wptr_mem):
+      if mem is not None:
+        from add import sysmem_dma_flush
+        sysmem_dma_flush(mem, len(mem))
+    boot.mmio_settle("pre-doorbell", heavy=False)
+    self.wptr = new_wptr % (RING_SIZE // 4)
+    self._publish_wptr(self.wptr)
+    self.dev.ring_doorbell(doorbell_index, self.wptr)
+    boot.mmio_sync_safe()
+    settle_ms = int(os.environ.get("AMD_BOOT_DOORBELL_SETTLE_MS", "50"))
+    if settle_ms:
+      time.sleep(settle_ms / 1000.0)
+    boot._check_pci("post-doorbell")
+
   def init(self):
-    self.ring_off = self._alloc_vram(RING_SIZE)
-    self.mqd_off = self._alloc_vram(4096)
-    self.eop_off = self._alloc_vram(GFX8_MEC_HPD_SIZE)
-    self.wptr_off = self._alloc_vram(4096)
-    self.ring_gpu = self.dev.vram_gpu_addr(self.ring_off)
-    self.mqd_gpu = self.dev.vram_gpu_addr(self.mqd_off)
-    self.eop_gpu = self.dev.vram_gpu_addr(self.eop_off)
-    self.wptr_gpu = self.dev.vram_gpu_addr(self.wptr_off)
+    self.ring_gpu, self.ring_mem, self.ring_off = self._alloc_buf(RING_SIZE)
+    self.mqd_gpu, self.mqd_mem, self.mqd_off = self._alloc_buf(4096)
+    self.eop_gpu, self.eop_mem, self.eop_off = self._alloc_buf(GFX8_MEC_HPD_SIZE)
+    wb_gpu, self.wptr_mem, self.wptr_off = self._alloc_buf(4096)
+    self.rptr_gpu = wb_gpu
+    self.wptr_gpu = wb_gpu + 64
+    if self.wptr_mem is not None:
+      self.wptr_mem[0:128] = bytes(128)
+      from add import sysmem_dma_flush
+      sysmem_dma_flush(self.wptr_mem, 128)
 
   def submit_ib(self, ib_words: list[int]):
     pkt = [pkt3(0x10, len(ib_words) + 2, 0), 0, len(ib_words) * 4] + ib_words
-    self._write_ring(pkt)
-    self.wptr = (self.wptr + len(pkt)) % (RING_SIZE // 4)
+    base = self.wptr
+    new_wptr = base + len(pkt)
+    pad = (VI_RING_ALIGN_MASK + 1) - (new_wptr & VI_RING_ALIGN_MASK)
+    pad &= VI_RING_ALIGN_MASK
+    if pad:
+      pkt = pkt + [0x80000000] * pad
+    self._write_ring(pkt, offset_dwords=base)
+    self.wptr = (base + len(pkt)) % (RING_SIZE // 4)
+    self.boot.hdp_flush()
+    self.boot.hdp_invalidate()
+    if self.ring_mem is not None:
+      from add import sysmem_dma_flush
+      sysmem_dma_flush(self.ring_mem, min(len(self.ring_mem), (base + len(pkt)) * 4))
+    self._publish_wptr(self.wptr)
     self.dev.ring_doorbell(self.doorbell_index, self.wptr)
 
-  def setup_with_kiq(self):
-    mqd = self._mqd_regs(self.ring_gpu, RING_SIZE, self.mqd_gpu, self.eop_gpu, self.wptr_gpu,
-                         self.doorbell_index, active=True)
-    self._mqd_commit(mqd)
-    kiq = ComputeQueue(self.boot, me=2, pipe=0, queue=0, doorbell_index=DOORBELL_KIQ)
+  def setup_with_kiq(self, map_queues: bool | None = None):
+    """gfx_v8_0_kiq_resume + kcq_resume (ref/linux gfx_v8_0.c)."""
+    if map_queues is None:
+      map_queues = os.environ.get("AMD_BOOT_KIQ_MAP", "1") == "1"
+    boot = self.boot
+    # 1) KIQ: RLC scheduler + MQD init + commit (activates KIQ HQD)
+    kiq = ComputeQueue(boot, me=KIQ_ME, pipe=KIQ_PIPE, queue=KIQ_QUEUE, doorbell_index=DOORBELL_KIQ)
     kiq.init()
-    kiq_pkt = kiq._map_queues_pkt(self)
-    kiq._write_ring(kiq_pkt)
-    kiq.wptr = len(kiq_pkt)
-    self.dev.ring_doorbell(DOORBELL_KIQ, kiq.wptr)
-    time.sleep(0.05)
+    boot.kiq_setting(kiq.me, kiq.pipe, kiq.queue)
+    kiq_mqd = mqd_init_vi(boot, kiq, is_kiq=True)
+    mqd_commit_vi(boot, kiq, kiq_mqd)
+    kiq._upload_mqd(kiq_mqd)
+    kiq_active = boot.read_hqd_active(kiq.me, kiq.pipe, kiq.queue)
+    if int(os.environ.get("DEBUG", "0")):
+      print(f"polaris: KIQ CP_HQD_ACTIVE={kiq_active:#x}", flush=True)
+
+    # 2) KCQ: MQD in GPU memory only (MAP_QUEUES activates HQD)
+    kcq_mqd = mqd_init_vi(boot, self, is_kiq=False)
+    self._upload_mqd(kcq_mqd)
+
+    if not map_queues:
+      if int(os.environ.get("DEBUG", "0")):
+        print("polaris: KIQ MAP_QUEUES skipped (AMD_BOOT_KIQ_MAP=0)", flush=True)
+      return
+
+    # 3) MAP_QUEUES via KIQ ring — linux: set_mec_doorbell_range then amdgpu_ring_commit
+    boot.set_mec_doorbell_range()
+    pkt = kiq._kiq_map_queues_pkt(self)
+    if int(os.environ.get("DEBUG", "0")):
+      print(f"polaris: KIQ MAP_QUEUES pkt_words={len(pkt)} "
+            f"kcq_mqd={self.mqd_gpu:#x} kcq_wptr={self.wptr_gpu:#x}", flush=True)
+    kiq._ring_commit(pkt, DOORBELL_KIQ)
+
+    # 4) Wait for KCQ activation (poll, no extra doorbells)
+    deadline = time.time() + float(os.environ.get("AMD_BOOT_KCQ_ACTIVE_TIMEOUT_S", "5"))
+    kcq_active = 0
+    while time.time() < deadline:
+      kcq_active = boot.read_hqd_active(self.me, self.pipe, self.queue)
+      if kcq_active & 1:
+        break
+      time.sleep(0.01)
+    if int(os.environ.get("DEBUG", "0")):
+      print(f"polaris: KCQ CP_HQD_ACTIVE={kcq_active:#x}", flush=True)
 

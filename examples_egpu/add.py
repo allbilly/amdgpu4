@@ -19,7 +19,14 @@ Usage:
   python3 examples_egpu/add.py --reset=mmio        # GRBM/SRBM soft reset only (PCI must be up)
   AMD_RESET_MODE=gentle|amd_cfg|pci|full python3 add.py --reset
   python3 examples_egpu/add.py --atom-info       # parse VBIOS ATOM tables (needs GPU)
-  python3 examples_egpu/add.py                    # boot + add kernel
+  python3 examples_egpu/add.py --boot-stage=pre-fw   # boot minus LoadUcodes
+  python3 examples_egpu/add.py --boot-stage=fw-rlc      # RLC only (~4k MMIO, safest fw probe)
+  python3 examples_egpu/add.py --boot-stage=fw-cp       # + PFP/CE/ME
+  python3 examples_egpu/add.py --boot-stage=fw-mec      # upload MEC, stay halted (~15s)
+  python3 examples_egpu/add.py --boot-stage=fw-start    # settle + unhalt ME1 only
+  python3 examples_egpu/add.py --boot-stage=fw-direct   # default RLC-only; full: AMD_BOOT_FW_MASK=0x47e
+  python3 examples_egpu/add.py --boot-stage=kiq       # + KIQ MQD (no MAP_QUEUES doorbell)
+  AMD_BOOT_FULL=1 python3 examples_egpu/add.py        # full vector-add (dangerous)
 """
 from __future__ import annotations
 import os, sys, ctypes, ctypes.util, time, mmap, struct, array, socket, subprocess, contextlib, functools, itertools, enum, dataclasses, urllib.request, hashlib, tempfile, pathlib
@@ -558,7 +565,9 @@ class PolarisDevice:
     return bar_off
 
   def ring_doorbell(self, index: int, wptr: int):
+    self.pci.drain_mmio(bar=5, reg=REG_GRBM_STATUS)
     self.doorbell[index] = wptr & 0xffffffff
+    self.pci.drain_mmio(bar=5, reg=REG_GRBM_STATUS)
 
   def alloc_vram(self, size: int, align=0x1000) -> int:
     off = round_up(self._vram_off, align)
@@ -604,6 +613,39 @@ class PolarisDevice:
     if last_err:
       raise last_err
 
+  def _boot_stage_fw_direct(self, b, fw_mask: int | None = None, unhalt: bool | None = None) -> int:
+    """ATOM → SMC → MC → GART → direct MMIO firmware (no KIQ/dispatch)."""
+    from polaris_boot import FW_RLC_ONLY
+    if fw_mask is None:
+      fw_mask = int(os.environ.get("AMD_BOOT_FW_MASK", str(FW_RLC_ONLY)), 0)
+    b.boot_through_fw_direct(fw_mask, unhalt=unhalt)
+    return fw_mask
+
+  def _boot_stage_kiq(self, b, map_queues: bool, skip_fw: bool = False) -> None:
+    """Firmware boot + KIQ/KCQ MQD; MAP_QUEUES doorbell optional."""
+    from polaris_boot import (KIQ_ME, KIQ_PIPE, KIQ_QUEUE, mmCP_MEC_CNTL,
+                              ComputeQueue, DOORBELL_MEC_RING0, FW_COMPUTE_MIN)
+    fw_mask = int(os.environ.get("AMD_BOOT_FW_MASK", str(FW_COMPUTE_MIN)), 0)
+    if skip_fw and b.compute_fw_loaded():
+      if int(os.environ.get("DEBUG", "0")):
+        print(f"polaris: skip fw re-upload (ME1 running CP_MEC_CNTL={b.rreg(mmCP_MEC_CNTL):#x})",
+              flush=True)
+      b.boot_minimal_for_compute()
+    else:
+      self._boot_stage_fw_direct(b, fw_mask=fw_mask, unhalt=False)
+      b.unhalt_loaded_firmware(fw_mask)
+      b.enable_compute()
+    cq = ComputeQueue(b, me=1, pipe=0, queue=0, doorbell_index=DOORBELL_MEC_RING0)
+    cq.init()
+    cq.setup_with_kiq(map_queues=map_queues)
+    if map_queues:
+      b._compute = cq
+    kiq_active = b.read_hqd_active(KIQ_ME, KIQ_PIPE, KIQ_QUEUE)
+    kcq_active = b.read_hqd_active(1, 0, 0)
+    print(f"stage=kiq map_queues={map_queues} skip_fw={skip_fw} "
+          f"CP_MEC_CNTL={b.rreg(mmCP_MEC_CNTL):#x} "
+          f"KIQ_HQD_ACTIVE={kiq_active:#x} KCQ_HQD_ACTIVE={kcq_active:#x}")
+
   def _boot_once(self, stage: str | None = None):
     from polaris_boot import PolarisBoot
     if self._boot is None:
@@ -646,6 +688,41 @@ class PolarisDevice:
       print(f"stage=smc smc_running={b.smc_running()} {b.smc_diag()}"); return
     if stage == "mc":
       b.vi_common_init(); b.start_smc(); b.mc_program(); b.load_mc_firmware(); print("stage=mc ok"); return
+    if stage == "fw-rlc":
+      from polaris_boot import FW_RLC_ONLY, mmCP_MEC_CNTL
+      mask = self._boot_stage_fw_direct(b, fw_mask=FW_RLC_ONLY, unhalt=False)
+      print(f"stage=fw-rlc mask={mask:#x} CP_MEC_CNTL={b.rreg(mmCP_MEC_CNTL):#x} smc={b.smc_running()}"); return
+    if stage == "fw-cp":
+      from polaris_boot import FW_RLC_ONLY, FW_CP_GFX_MASK, mmCP_MEC_CNTL
+      mask = self._boot_stage_fw_direct(b, fw_mask=FW_RLC_ONLY | FW_CP_GFX_MASK)
+      print(f"stage=fw-cp mask={mask:#x} CP_MEC_CNTL={b.rreg(mmCP_MEC_CNTL):#x}"); return
+    if stage == "fw-mec":
+      from polaris_boot import FW_COMPUTE_MIN, mmCP_MEC_CNTL
+      mask = self._boot_stage_fw_direct(b, fw_mask=FW_COMPUTE_MIN, unhalt=False)
+      print(f"stage=fw-mec mask={mask:#x} CP_MEC_CNTL={b.rreg(mmCP_MEC_CNTL):#x} "
+            f"(upload only — run fw-start to unhalt)"); return
+    if stage == "fw-start":
+      from polaris_boot import FW_COMPUTE_MIN, mmCP_MEC_CNTL
+      fw_mask = int(os.environ.get("AMD_BOOT_FW_MASK", str(FW_COMPUTE_MIN)), 0)
+      b.unhalt_loaded_firmware(fw_mask)
+      print(f"stage=fw-start mask={fw_mask:#x} CP_MEC_CNTL={b.rreg(mmCP_MEC_CNTL):#x}"); return
+    if stage == "fw-sdma":
+      from polaris_boot import FW_COMPUTE_MIN, UCODE_ID_SDMA0_MASK, UCODE_ID_SDMA1_MASK, mmCP_MEC_CNTL
+      mask = self._boot_stage_fw_direct(b, fw_mask=FW_COMPUTE_MIN | UCODE_ID_SDMA0_MASK | UCODE_ID_SDMA1_MASK)
+      print(f"stage=fw-sdma mask={mask:#x} CP_MEC_CNTL={b.rreg(mmCP_MEC_CNTL):#x}"); return
+    if stage == "fw-direct":
+      from polaris_boot import mmCP_MEC_CNTL
+      mask = self._boot_stage_fw_direct(b)
+      print(f"stage=fw-direct mask={mask:#x} CP_MEC_CNTL={b.rreg(mmCP_MEC_CNTL):#x} "
+            f"smc={b.smc_running()} "
+            f"(full fw: AMD_BOOT_FW_MASK=0x47e)"); return
+    if stage == "kiq":
+      self._boot_stage_kiq(b, map_queues=False, skip_fw=False); return
+    if stage == "kiq-map":
+      if os.environ.get("AMD_BOOT_KIQ_MAP", "1") != "1":
+        print("BLOCKED: kiq-map requires AMD_BOOT_KIQ_MAP=1", file=sys.stderr)
+        sys.exit(2)
+      self._boot_stage_kiq(b, map_queues=True, skip_fw=True); return
     b.boot()
     self._vram_start = b.vram_start
 
@@ -655,29 +732,40 @@ class PolarisDevice:
     cq = self._boot.init_compute_queue()
     cq.submit_ib(ib_words)
 
-  def run_add(self, a=(1.0, 2.0, 3.0, 4.0), b=(10.0, 20.0, 30.0, 40.0)):
+  def run_add(self, a=(1.0, 2.0, 3.0, 4.0), b_vals=(10.0, 20.0, 30.0, 40.0)):
     self.boot()
-    expected = [x + y for x, y in zip(a, b)]
+    boot = self._boot
+    use_gtt = not boot.probe_bar0_writes()
+
+    def put_buf(data: bytes, size: int = 0x1000) -> tuple[int, object | None]:
+      nbytes = max(size, len(data), 0x1000)
+      if use_gtt:
+        gpu_va, mem, _ = boot.alloc_gtt_buffer(nbytes)
+        mem[0:len(data)] = data
+        sysmem_dma_flush(mem, len(data))
+        return gpu_va, mem
+      off = self.alloc_vram(nbytes)
+      self.upload(off, data)
+      return self.vram_gpu_addr(off), None
+
+    expected = [x + y for x, y in zip(a, b_vals)]
     a_bytes = struct.pack("4f", *a)
-    b_bytes = struct.pack("4f", *b)
+    b_bytes = struct.pack("4f", *b_vals)
     out_bytes = bytes(16)
-    a_off = self.alloc_vram(0x1000)
-    b_off = self.alloc_vram(0x1000)
-    out_off = self.alloc_vram(0x1000)
-    shader_off = self.alloc_vram(round_up(len(ADD_SHADER), 0x100))
-    self.upload(a_off, a_bytes)
-    self.upload(b_off, b_bytes)
-    self.upload(out_off, out_bytes)
-    self.upload(shader_off, ADD_SHADER)
-    # GPU virtual addresses in VRAM aperture (set during mc_program)
-    a_va = self.vram_gpu_addr(a_off)
-    b_va = self.vram_gpu_addr(b_off)
-    out_va = self.vram_gpu_addr(out_off)
-    shader_va = self.vram_gpu_addr(shader_off)
+    a_va, _ = put_buf(a_bytes)
+    b_va, _ = put_buf(b_bytes)
+    out_va, out_mem = put_buf(out_bytes)
+    shader_va, _ = put_buf(ADD_SHADER, round_up(len(ADD_SHADER), 0x100))
     ib = PM4Builder().build_dispatch_ib(shader_va, out_va, a_va, b_va)
-    if DEBUG >= 1: print(f"polaris: ib_words={len(ib)} shader={len(ADD_SHADER)} expected={expected}")
+    if DEBUG >= 1: print(f"polaris: ib_words={len(ib)} shader={len(ADD_SHADER)} "
+                          f"gtt={use_gtt} expected={expected}")
     self.submit_compute_ib(ib)
-    result = list(struct.unpack("4f", bytes(self.vram[out_off:out_off+16])))
+    time.sleep(0.1)
+    if out_mem is not None:
+      result = list(struct.unpack("4f", bytes(out_mem[0:16])))
+    else:
+      out_off = out_va - (self._vram_start or 0)
+      result = list(struct.unpack("4f", bytes(self.vram[out_off:out_off + 16])))
     print(f"result={result}")
     return result
 
@@ -758,6 +846,12 @@ def main():
     dev = PolarisDevice()
     dev.boot(stage=stage)
     return
+  if os.environ.get("AMD_BOOT_FULL") != "1":
+    print("BLOCKED: full boot can kernel-panic macOS over USB4.", file=sys.stderr)
+    print("  Safe:  python3 add.py --probe | --selftest | --boot-stage=atom | --boot-stage=pre-fw", file=sys.stderr)
+    print("  Stage: python3 add.py --boot-stage=fw-rlc | fw-cp | fw-mec | fw-direct", file=sys.stderr)
+    print("  Full:  AMD_BOOT_FULL=1 python3 add.py   (only after --boot-stage=kiq shows KIQ_HQD_ACTIVE!=0)", file=sys.stderr)
+    sys.exit(2)
   t0 = time.perf_counter()
   dev = PolarisDevice()
   if os.environ.get("AMD_ADD_TRACE_STAGES") == "1":

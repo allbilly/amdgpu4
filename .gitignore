@@ -1,5 +1,7 @@
 # Build outputs (reproducible via `make` / `make shaders`)
 /build/
+__pycache__/
+*.pyc
 
 # Compiler / linker intermediates
 *.o
@@ -21,3 +23,4 @@ triangle.ppm
 /ref/
 /mgpusim/
 /navisim/
+examples_egpu/__pycache__/add.cpython-314.pyc
