@@ -2,73 +2,144 @@
 
 **Goal:** Run vector-add on **AMD RX570 (Polaris10 / gfx803, `1002:67df`)** via **TinyGPU.app** bare-metal MMIO/PM4 — not macOS `AMDRadeon*` kexts.
 
-**Last updated:** 2026-07-09 ~01:46 — **current blocker: reboot loop from mid-asic_init GPU state**
+**Last updated:** 2026-07-09 ~09:40 — **session #14: GART host-table base was wrong MC address**
 
 ## Current blocker (read this first)
 
-We are **not** blocked on "can TinyGPU do DMA at all" — the NV eGPU path proves
-device→host DMA over this USB4 transport works. We are blocked on **two coupled
-problems**:
+**We have never gotten `write_ok=True` on `sdma-probe`.** Vector-add is blocked on
+proving one SDMA `WRITE_LINEAR` dword into host sysmem via GART.
 
-### 1. Reboot loop — the GPU is in a dangerous persistent state
+### Session #14 code fix (just landed — HW validation pending)
 
-The eGPU enclosure keeps the card powered across macOS reboots. After the
-**interrupted** ATOM `asic_init` at ~01:33 (`AMD_ATOM_JUMP_MAX=512` aborted a
-training loop at `MISC0=0x50609162`), the ASIC was left **mid-init** — worse than
-the previous "stale but idle" state.
+Root cause of ring-fetch stall / garbage walk with host PTE table:
 
-Since then, **every** macOS boot re-enumerates that broken device and the Apple T8103
-USB4 root port panics within seconds-to-minutes — often with **no** `add.py` command
-running (01:28 spontaneous, 01:41 panic ~20 s after a read-only `--probe`). This is
-a **reboot loop**, not a single bad boot-stage.
+| Bug | Was | Correct |
+|-----|-----|---------|
+| `PAGE_TABLE_BASE` for host table | raw TinyGPU DMA (`0x4000`) + `PTE_REQUEST_PHYSICAL=1` | **AGP MC addr** `agp_start+dma` (Linux/TrustOS); `VM_L2_CNTL4=0` |
+| Why it failed | `0x4000` is outside SYSTEM_APERTURE → walker hits VRAM default page → garbage PTEs → ≥4 GB TLP or stall | AGP window routes walker read to PCIe by construction |
+| DCE scanout | left running (VBIOS) | `disable_vga_dce()` before GMC/SDMA (TrustOS DMIF VMID0 faults) |
+| `SDMA0_CNTL` | clear AUTO_CTXSW, set ATC_L1 | TrustOS baseline **TRAP only (`0x1`)** |
+| `SDMA0_GFX_RB_CNTL` | RMW VBIOS value (could keep `RB_SWAP`) | rebuild `0x31015`-style: size + timer, **no SWAP** |
+| VMID loop | only VMID0 `VIRTUAL_ADDR=0` | all 16 VMIDs via `srbm_select` (Linux `sdma_v3_0_gfx_resume`) |
 
-**Must recover before any further bring-up:**
-1. Physical power-cycle the eGPU enclosure (unplug/replug TB), **or**
-2. `python3 add.py --reset` (AMD cfg 0x7c `vi_asic_pci_config_reset`) immediately
-   after boot, before macOS has time to touch the device
-3. Then run a **complete** ATOM `asic_init` with the **default** jump budget — never
-   cap with `AMD_ATOM_JUMP_MAX=512` again
+### What works
 
-### 2. Device→host DMA proof still unproven — needs full ATOM, not minimal boot
+| step | status |
+|------|--------|
+| TinyGPU PCI enumerate + MMIO | OK (`1002:67df`, BAR0/2/5 up) |
+| CPU-side GART PTE build (`gart-probe`) | OK (64-bit PTEs) |
+| SDMA ucode MMIO upload (no SMC) | OK (~3k words, F32 halted) |
+| Minimal sdma-probe (no ATOM) | **no panic**, but ring fetch stalls (`MC_RD_IDLE=0`, `rptr=0`) |
+| `sdma_soft_reset()` after stall | engine returns `IDLE=1` |
+| `--reset` after replug | OK (`CONFIG_MEMSIZE=0`, clean cold state) |
 
-| boot path | device→host read | result |
-|-----------|------------------|--------|
-| Minimal (no ATOM, no SMC, no MEC) + AGP or GART | MC read stalls inside chip (`MC_RD_IDLE=0`) | **no panic**, no data |
-| Full (ATOM+SMC) + GART (earlier sessions) | reads leave chip with garbage ≥4 GB addr | **panic** `apciec 0x200000` |
-| Interrupted ATOM (this session) | unknown — aborted mid-training | **panic loop** |
+### What fails
 
-The minimal path (`boot_sdma_minimal`, `AMD_BOOT_SDMA_ATOM=0`) is safe-ish (no panic)
-but useless: SDMA wedges on its first ring fetch because the MC-hub/BIF outbound
-system-read path was never initialized (that init lives in ATOM `asic_init` and/or
-SMC/MC fw — see Linux `gmc_v8_0_gart_enable` + `vi_common_init`).
+| step | symptom |
+|------|---------|
+| SDMA ring fetch → host sysmem | engine wedged: `STATUS=0x4494…`, `IDLE=0`, `MC_RD_IDLE=0`, dst stays `0xCAFEDEAD` |
+| Full boot (ATOM and/or engine unhalt with bad addresses) | kernel panic `apciec 0x200000` |
+| Interrupted ATOM `asic_init` | **reboot loop** — GPU state persists across macOS reboots (enclosure keeps power) |
+| Spontaneous panics (no `add.py` running) | same `0x200000` — stale/mid-init GPU enumerated by macOS |
 
-The **correct next attempt** (once recovered from the reboot loop):
+### Root cause (layered)
+
+1. **Panic layer:** Apple T8103 USB4 root port bit `0x200000` = device→host TLP with
+   bus address **≥ 32 bits** (garbage MC addr from bad GART walk, stale ring bases, or
+   mid-init ASIC). Fix: only emit verified <4 GB IOVAs from `PrepareDMA`; never leave
+   GPU in half-initialized state on the link.
+
+2. **Functional layer:** Outbound MC system-read path not live until **full init chain**
+   completes. Linux order (non-negotiable):
+   ```
+   atom_asic_init → gmc_hw_init (mc_program + polaris10_mc.bin + gart_enable)
+   → SDMA ucode → sdma_v3_0_gfx_resume → ring_test_ring
+   ```
+   Skipping ATOM = fetch stalls inside chip (no panic, no data). Skipping MC ucode /
+   full `gart_enable` = same stall. Interrupted ATOM = worst case (panic loop).
+
+3. **GART host-table addressing (session #14):** walker `PAGE_TABLE_BASE` must be an
+   **MC** address inside the AGP aperture (`agp_start + dma`), not a raw host phys.
+   Linux keeps the table in VRAM and clears `PTE_REQUEST_PHYSICAL`; we mirror that
+   clear and use AGP for the host-backed table.
+
+4. **SDMA-specific (TrustOS):** `AUTO_CTXSW=0` without RLC; `RB_SWAP=0`; DCE quiesced;
+   `CONTEXT_CNTL=0` after unhalt.
+
+### Recovery protocol (before next HW attempt)
+
+1. **Physical replug** eGPU enclosure if spontaneous panics persist
+2. Boot macOS → **immediately** `python3 add.py --reset` (cfg 0x7c)
+3. Run **one** guarded probe — do not interrupt ATOM:
+   ```bash
+   AMD_BOOT_SDMA_PROBE=1 AMD_BOOT_SDMA_AGP=0 AMD_BOOT_GART_SYSMEM=1 \
+     python3 add.py --boot-stage=sdma-probe
+   ```
+   - Default `AMD_BOOT_SDMA_ATOM=1` (full jump budget, **never** `AMD_ATOM_JUMP_MAX=512`)
+   - No SMC, no MEC — SDMA-only path
+   - Expect ATOM to take several minutes; do not kill mid-run
+4. Success criterion: `write_ok=True dst=0xdeadbeef` without panic
+5. If panic during probe: note whether ATOM finished (`MEMSIZE≠0`, `MISC0&0x80`)
+
+### Code landed (do not roll back)
+
+- 64-bit GART PTEs + **AGP MC** page-table base + `VM_L2_CNTL4=0` (session #14)
+- `disable_vga_dce()` — VGA HDP + CRTC master off before GMC/SDMA
+- `gmc_hw_init_for_dma()` — `mc_program` + `polaris10_mc.bin` + TLB/L2
+- `_sdma_disable_auto_ctxsw()` — TrustOS TRAP-only `SDMA0_CNTL=0x1`
+- `_sdma_gfx_ring_setup` — TrustOS `RB_CNTL` rebuild, all-VMID clear, CONTEXT clear post-unhalt
+- SDMA ring teardown, SDMA-only fw upload, `sdma_soft_reset()` cleanup
+- `boot_sdma_minimal()`: ATOM default on, GART default for probe
+
+### Still to try (ordered by risk)
+
+1. Complete ATOM + GART sdma-probe with session #14 fixes — **current plan**
+2. If still stalls: AGP-only ring/dst (`AMD_BOOT_SDMA_AGP=1`) with full ATOM
+3. Only if both fail: revisit FB_LOCATION / system-aperture edge cases
+
+
+## Reference repos — helpfulness for current blocker (reranked, session #13)
+
+Blocker: **prove SDMA device→host DMA on M1/USB4** without `apciec 0x200000` panic.
+
+| Rank | Repo | Score | Why for *this* blocker |
+|------|------|-------|------------------------|
+| **1** | `torvalds/linux` / `ROCm/amdgpu` / `allbilly/amdgpu` | ★★★★★ | Law: `amdgpu_atom_asic_init` → `gmc_v8_0_hw_init` (golden, `mc_program`, **polaris10_mc.bin**, `gart_enable`) → `sdma_v3_0_gfx_resume` → `ring_test_ring`. MC ucode waits for `MISC0&0x80`. |
+| **2** | `nathan237/TrustOS` | ★★★★★ | Bare-metal Polaris SDMA/GART: `CONTEXT_CNTL=0`, **AUTO_CTXSW=0 without RLC** (silent stall), DCE scanout can fault VMID0, system-aperture shift `>>12`. |
+| **3** | `tinygrad/tinygrad` | ★★★★☆ | TinyGPU `PrepareDMA`/`MAP_SYSMEM_FD` = device DMA addrs; `sysmem_dma_flush` for ARM coherency. |
+| **4** | `geerlingguy/raspberry-pi-pcie-devices` | ★★★★☆ | ARM PCIe DMA coherency (#756) — CPU cache vs device visibility. |
+| **5** | `kc9zda/atombios-inspect` | ★★★☆☆ | ATOM table decode for `asic_init` debug when jump loops stick. |
+| **6** | `vosen/amdgpu_debug` | ★★★☆☆ | MMIO trace / debug patterns. |
+| **7** | `boopdotpng/tenstorrent-docs` | ★★★☆☆ | Documents tinygrad AMD = PCI DMA segments + GPU page tables (not noc_address). |
+| **8** | `allbilly/amdgpu` (wiki) | ★★★☆☆ | eGPU bring-up notes: GART before LoadUcodes, ATOM replay when BAR0 dead. |
+| **9** | `TheTom/pascal-egpu` | ★★☆☆☆ | Apple Silicon eGPU transport works; NV secure-boot differs from AMD Polaris. |
+| **10** | `Zile995/PinnacleRidge-Polaris-GPU-Passthrough` | ★★☆☆☆ | VF/IOMMU passthrough on x86 — peripheral to bare-metal M1. |
+| **11** | `Aitbytes/proxmox-amd-gpu-passthrough` | ★★☆☆☆ | Proxmox VFIO passthrough — IOMMU groups, not TinyGPU. |
+| **12** | `Andybf/AtomBiosEditor` | ★★☆☆☆ | VBIOS patch tool if ATOM tables need editing. |
+| **13** | `xCuri0/ReBarUEFI` | ★☆☆☆☆ | ReBAR — not our 32-bit IOVA panic. |
+| **14** | `komen205/polaris30-smu-bist` | ★☆☆☆☆ | SMU BIST — niche debug. |
+| **15** | `ChefKissInc/NootedRed` / `NootRX` | ★☆☆☆☆ | macOS **iGPU** kext SDMA0-only patches. |
+| **16** | `coreboot`, `Whatevergreen`, `atitool`, `VirtualSMC`, `macOS-Tahoe-Ryzentosh` | ☆☆☆☆☆ | Wrong platform / wrong GPU / Hackintosh, not eGPU bare-metal. |
+| **17** | Simulators (`gem5`, `mgpusim`, `gpgpu-sim`, `rdna-sim`, `miaow`, `ClusterSim`) | ☆☆☆☆☆ | Not applicable. |
+| **18** | `allbilly/applegpu`, `allbilly/amd_scheduler`, `allbilly/ml_workload` | ☆☆☆☆☆ | Unrelated to Polaris10 USB4 bring-up. |
+
+**Linux init order (confirmed from `gmc_v8_0_hw_init` + `sdma_v3_0_gfx_resume`):**
 ```
-# after enclosure power-cycle OR immediate --reset
-AMD_BOOT_SDMA_PROBE=1 AMD_BOOT_SDMA_AGP=0 AMD_BOOT_GART_SYSMEM=1 \
-  python3 add.py --boot-stage=sdma-probe
+atom_asic_init (VBIOS POST — trains VRAM, sets MEMSIZE)
+→ gmc_sw_init
+→ gmc_v8_0_hw_init: golden_regs + mc_program + polaris10_mc.bin (if not trained by VBIOS) + gart_enable
+→ SDMA ucode (MMIO ok without SMC per gfx_v7_0 direct path)
+→ sdma_v3_0_gfx_resume: ring in GART, AUTO_CTXSW only if RLC loaded
+→ sdma_v3_0_enable(unhalt) + ring_test_ring
 ```
-This runs: full ATOM asic_init (default jump budget) → apertures + 64-bit GART PTEs
-→ SDMA-only ucode (halted until ring programmed) → one `WRITE_LINEAR` proof.
-Still **no SMC, no MEC** — smallest path that can actually complete a host read.
 
-### Panic signature (unchanged across all sessions)
+**Session #13 code fix:** `_sdma_disable_auto_ctxsw()` — clears `SDMA0_CNTL.AUTO_CTXSW_ENABLE`
+(TrustOS: without RLC, F32 silently refuses to fetch ring). Called before SDMA fw upload
+and ring setup.
 
-`apciec[pcic0-bridge] unhandled interrupts (0x200000 out of 0x220000)` =
-Apple T8103 root port, interrupt bit 21 = **device→host request address ≥ 32 bits**.
-Fires when the GPU emits a TLP at a garbage MC address. Our GART PTEs now emit
-verified <4 GB IOVAs; the remaining panics are stale-engine junk or mid-init state.
-
-### Code fixes already landed (do not roll back)
-
-- 64-bit GART PTEs + physical page-table base + `PTE_REQUEST_PHYSICAL` (session #9)
-- SDMA ring teardown before halt/unhalt (panic #7)
-- SDMA-only fw upload without touching live MEC (panic #7)
-- AGP aperture path + `boot_sdma_minimal()` (session #10)
-- `mc_setup_tlb_apertures()` matching Linux `gmc_v8_0_gart_enable` field-exact
-- `sdma_soft_reset()` auto-cleanup on wedged MC read (engine recovers to IDLE=1)
-- `AMD_BOOT_SDMA_ATOM` gate (default 0 = skip ATOM; use 1 for the real attempt)
-
+**09:08 panic:** overnight spontaneous `apciec 0x200000`.
+**~09:12:** replug + `--reset` OK (`CONFIG_MEMSIZE=0`).
+**~09:15 crash:** again before `sdma-probe` reported `write_ok` — see **Current blocker** above.
 
 ## Session #11 — bit 21 decoded: **"Request address is greater than 32 bits"**
 
@@ -168,7 +239,20 @@ abort it with a tight iteration cap; use the default budget and let it finish.
   sdma-probe. If `--reset` cannot stop the spontaneous panics, the eGPU enclosure
   needs a physical power-cycle before the next attempt.
 
-## Session #10 — read the panic logs; FB-aperture collision hypothesis
+### Session #12 — replug + Linux `gmc_v8_0_hw_init` gap closed
+
+After replug (`CONFIG_MEMSIZE=0`, clean PCI). Code changes this session:
+
+- **`gmc_hw_init_for_dma()`** — mirrors Linux `gmc_v8_0_hw_init` minus SMC: `mc_program`
+  → `load_mc_firmware()` (polaris10_mc.bin) → re-`mc_program` if ATOM trained VRAM
+  → `mc_program_apertures` + `mc_setup_tlb_apertures` + `gmc_program_vm_l2`.
+  Root cause of ring-fetch stall without ATOM: we never loaded MC ucode.
+- **`gmc_program_vm_l2()`** — VM_L2_CNTL/2/3 from `gmc_v8_0_gart_enable`; AGP path was
+  missing this entirely.
+- **`boot_sdma_minimal()`** default `AMD_BOOT_SDMA_ATOM=1` (full jump budget, no cap).
+- **`sdma-probe`** default GART mode (`AMD_BOOT_SDMA_AGP=0`) — verified <4GB IOVAs.
+- Next HW command after replug:
+  `AMD_BOOT_SDMA_PROBE=1 python3 add.py --boot-stage=sdma-probe`
 
 Read `/Library/Logs/DiagnosticReports/panic-full-*.panic`. **Every** panic (23:57, 00:04,
 00:09, 00:16) is byte-identical:

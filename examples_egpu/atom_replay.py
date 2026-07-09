@@ -391,7 +391,11 @@ def atom_info(bios: bytes) -> dict:
 def vram_training_ok(boot: "PolarisBoot") -> bool:
   mem_mb = boot.rreg(0x150a) & 0xffff
   misc0 = boot.rreg(0xa80)
-  return mem_mb >= 128 and bool(misc0 & 0x80)
+  fb_loc = boot.rreg(0x809)
+  # MEMSIZE+MISC0 alone can survive a soft reset while FB_LOCATION is cleared —
+  # require a real FB aperture before treating the ASIC as posted.
+  return (mem_mb >= 128 and bool(misc0 & 0x80)
+          and fb_loc not in (0, 0xffffffff) and (fb_loc & 0xffff) != 0)
 
 
 def need_asic_init(boot: "PolarisBoot") -> bool:

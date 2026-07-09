@@ -801,7 +801,7 @@ class PolarisDevice:
               file=sys.stderr)
         sys.exit(2)
       from polaris_boot import mmSDMA0_F32_CNTL
-      use_agp = os.environ.get("AMD_BOOT_SDMA_AGP", "1") == "1"
+      use_agp = os.environ.get("AMD_BOOT_SDMA_AGP", "0") == "1"
       if b.compute_fw_loaded():
         # Hot GPU: never touch the live MEC — only make sure SDMA ucode is resident
         # (halted). AGP mode needs no GART; probe_sdma_dma programs apertures itself.
@@ -813,13 +813,11 @@ class PolarisDevice:
           if b.gart_pte_mem is None:
             b.gart_enable()
       else:
-        # Cold GPU: smallest possible bring-up — ATOM + apertures + SDMA ucode only.
-        # No SMC, no RLC/CP/MEC (each is an extra async-DMA crash surface, session #10).
+        # Cold GPU: ATOM asic_init (default) + gmc_hw_init_for_dma + SDMA ucode only.
+        # No SMC, no RLC/CP/MEC. Default GART table in VRAM (Linux/TrustOS) so the
+        # walker never DMA-reads host; ring/dst still map to host via SYSTEM PTEs.
+        os.environ.setdefault("AMD_BOOT_GART_SYSMEM", "0")
         b.boot_sdma_minimal()
-        if not use_agp:
-          os.environ["AMD_BOOT_GART_SYSMEM"] = "1"
-          if b.gart_pte_mem is None:
-            b.gart_enable()
       r = b.probe_sdma_dma()
       print(f"stage=sdma-probe mode={r.get('mode')} write_ok={r['write_ok']} "
             f"ring_drained={r['ring_drained']} dst={r['dst_value']:#x} "
