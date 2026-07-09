@@ -61,6 +61,7 @@ mmSMC_MSG_ARG_0 = 0xa4
 mmSMC_IND_INDEX_11 = 0x1ac
 mmSMC_IND_DATA_11 = 0x1ad
 mmMC_SEQ_MISC0 = 0xa80
+mmMC_SEQ_STATUS_M = 0xa91  # PWRUP_COMPL[1:0], CMD_RDY[3:2]
 mmMC_SEQ_IO_DEBUG_INDEX = 0xa29
 mmMC_SEQ_IO_DEBUG_DATA = 0xa2a
 mmMC_SEQ_SUP_CNTL = 0xa2f
@@ -111,8 +112,20 @@ mmSDMA1_UCODE_DATA = 0x3601
 mmSDMA1_F32_CNTL = 0x3612
 SDMA1_REG_OFFSET = 0x200
 # oss_3_0_d.h — SDMA0 GFX ring (sdma_v2_4_gfx_resume)
+mmSDMA0_POWER_CNTL = 0x3402
+mmSDMA0_CLK_CTRL = 0x3403
+mmSDMA0_CNTL = 0x3404
+mmSDMA0_CHICKEN_BITS = 0x3405
 mmSDMA0_TILING_CONFIG = 0x3406
+mmGB_ADDR_CONFIG = 0x263e  # gfx_8_0_d.h; polaris10 golden 0x22011003
 mmSDMA0_SEM_WAIT_FAIL_TIMER_CNTL = 0x3409
+mmSDMA0_FREEZE = 0x3413
+# sdma_v3_0.c fiji/polaris golden: POWER_CNTL mask 0x800 → 0x3c800
+SDMA0_POWER_CNTL_GOLDEN = 0x0003c800
+# golden_settings_polaris10_a11: CHICKEN mask 0xfc910007 → 0x00810007
+SDMA0_CHICKEN_BITS_GOLDEN = 0x00810007
+SDMA0_CHICKEN_BITS_MASK = 0xfc910007
+SDMA0_GFX_RB_WPTR_POLL_CNTL__F32_POLL_ENABLE_MASK = 0x4
 mmSDMA0_GFX_RB_CNTL = 0x3480
 mmSDMA0_GFX_RB_BASE = 0x3481
 mmSDMA0_GFX_RB_BASE_HI = 0x3482
@@ -122,7 +135,6 @@ mmSDMA0_GFX_IB_CNTL = 0x348a
 mmSDMA0_GFX_CONTEXT_CNTL = 0x3493
 mmSDMA0_GFX_VIRTUAL_ADDR = 0x34a7
 mmSDMA0_GFX_APE1_CNTL = 0x34a8
-mmSDMA0_CNTL = 0x3404
 SDMA0_CNTL__TRAP_ENABLE_MASK = 0x1
 SDMA0_CNTL__AUTO_CTXSW_ENABLE_MASK = 0x40000
 SDMA0_CNTL__ATC_L1_ENABLE_MASK = 0x2
@@ -131,8 +143,16 @@ mmSDMA0_GFX_RB_RPTR_ADDR_HI = 0x3488
 mmSDMA0_GFX_RB_RPTR_ADDR_LO = 0x3489
 mmSDMA0_GFX_DOORBELL = 0x3492
 mmSDMA0_STATUS_REG = 0x340d
+mmSDMA0_STATUS1_REG = 0x340e
+mmSDMA0_STATUS2_REG = 0x3423
+mmSDMA0_GFX_DUMMY_REG = 0x34b1
 SDMA0_STATUS_REG__IDLE_MASK = 0x1
 SDMA0_STATUS_REG__MC_RD_IDLE_MASK = 0x80000
+SDMA0_STATUS2_REG__F32_INSTR_PTR_MASK = 0xffc
+SDMA0_STATUS2_REG__F32_INSTR_PTR__SHIFT = 2
+SDMA0_STATUS2_REG__CMD_OP_MASK = 0xffff0000
+SDMA0_STATUS2_REG__CMD_OP__SHIFT = 16
+SDMA0_POWER_CNTL__MEM_POWER_OVERRIDE_MASK = 0x100
 mmSRBM_SOFT_RESET = 0x0398
 SRBM_SOFT_RESET__SOFT_RESET_SDMA_MASK = 0x100000
 SRBM_SOFT_RESET__SOFT_RESET_SDMA1_MASK = 0x40
@@ -163,17 +183,21 @@ SDMA0_GFX_RB_CNTL__RB_ENABLE_MASK = 0x1
 SDMA0_GFX_RB_CNTL__RB_ENABLE__SHIFT = 0
 SDMA0_GFX_RB_CNTL__RB_SIZE_MASK = 0x3e
 SDMA0_GFX_RB_CNTL__RB_SIZE__SHIFT = 1
+# TrustOS bare-metal: RB_PRIV (bit 23) required without IOMMU for packet execute.
+SDMA0_GFX_RB_CNTL__RB_PRIV_MASK = 0x800000
+SDMA0_GFX_RB_CNTL__RB_PRIV__SHIFT = 23
 SDMA0_GFX_IB_CNTL__IB_ENABLE_MASK = 0x1
 SDMA0_GFX_IB_CNTL__IB_ENABLE__SHIFT = 0
 SDMA_RING_SIZE = 4096  # bytes — amdgpu default; rb_size field = order_base_2(size/4)
 # tonga_sdma_pkt_open.h (VI / Polaris)
 SDMA_OP_NOP = 0
 SDMA_OP_WRITE = 2
+SDMA_OP_SRBM_WRITE = 14
 SDMA_SUBOP_WRITE_LINEAR = 0
 
 
-def _sdma_pkt_hdr(op: int, sub_op: int = 0) -> int:
-  return (op & 0xff) | ((sub_op & 0xff) << 8)
+def _sdma_pkt_hdr(op: int, sub_op: int = 0, byte_en: int = 0) -> int:
+  return (op & 0xff) | ((sub_op & 0xff) << 8) | ((byte_en & 0xf) << 28)
 
 
 def _reg_set_field(val: int, mask: int, shift: int, field: int) -> int:
@@ -596,12 +620,10 @@ class PolarisBoot:
   def boot_sdma_minimal(self):
     """Cold-GPU bring-up for the SDMA DMA proof with the smallest crash surface.
 
-    [optional ATOM asic_init] → apertures (FB + AGP) → SDMA-only ucode (halted).
-    Deliberately NO SMC start and NO RLC/CP/MEC: SDMA ucode is MMIO-uploaded and
-    doesn't need the SMU, and every extra live engine/fw bootstrap is another async
-    DMA source that can trip the USB4 root port (apciec 0x200000, session #10).
-    AMD_BOOT_SDMA_ATOM=1 (default after replug) runs ATOM asic_init with the full
-    jump budget. AMD_BOOT_SDMA_ATOM=0 skips it (safe but ring fetch stalls)."""
+    [optional ATOM asic_init] → [optional SMC for SCLK/MCLK] → apertures → SDMA ucode.
+    Default: NO SMC (session #10 panic surface). TrustOS needed SMU running
+    (SCLK/MCLK) before SDMA RPTR advanced — set AMD_BOOT_SDMA_SMC=1 to enable.
+    AMD_BOOT_SDMA_ATOM=1 (default) runs ATOM asic_init with the full jump budget."""
     self.vi_common_init()
     os.environ.setdefault("AMD_BOOT_SDMA_ATOM", "1")
     if os.environ.get("AMD_BOOT_SDMA_ATOM", "1") == "1":
@@ -610,6 +632,16 @@ class PolarisBoot:
       run_asic_init_if_needed(self)
     self.gmc_sw_init()
     self.gmc_hw_init_for_dma()
+    if os.environ.get("AMD_BOOT_SDMA_SMC", "0") == "1" or \
+       os.environ.get("AMD_BOOT_SDMA_SMC_UCODE", "0") == "1":
+      # TrustOS: SMU bring-up → SCLK/MCLK before SDMA ring fetch works.
+      # Linux Polaris: SDMA ucode is loaded by SMC LoadUcodes (smu7_request_smu_load_fw),
+      # not CIK-style MMIO UCODE_DATA — set AMD_BOOT_SDMA_SMC_UCODE=1 for that path.
+      print("polaris: SDMA path starting SMC (AMD_BOOT_SDMA_SMC / SMC_UCODE)",
+            flush=True)
+      if not self.smc_running():
+        self.start_smc()
+      print(f"polaris: SMC running={self.smc_running()} {self.smc_diag()}", flush=True)
     # Cheap liveness gate: if the SDMA block isn't clocked without asic_init, fail
     # cleanly here instead of uploading into a dead block / unhalting garbage.
     self.wreg(mmSDMA0_GFX_RB_WPTR, 0xA5A58)
@@ -619,7 +651,21 @@ class PolarisBoot:
       raise RuntimeError(
         f"SDMA regs not responding (wrote 0xA5A58, read {got:#x}) — "
         "block needs asic_init; retry with AMD_BOOT_SDMA_ATOM=1")
-    self.load_sdma_firmware_only(unhalt=False)
+    # Prefer Linux Polaris path: SMC LoadUcodes with AGP-hosted TOC (VRAM TOC
+    # is unsafe — BAR0/MM data path dead). Falls back to direct MMIO upload.
+    if os.environ.get("AMD_BOOT_SDMA_SMC_UCODE", "0") == "1" and self.smc_running():
+      os.environ.setdefault("AMD_BOOT_FW_LAYOUT", "agp")
+      os.environ.setdefault("AMD_BOOT_FW_MASK", "0x6")  # SDMA0|SDMA1 only
+      os.environ.setdefault("AMD_BOOT_FW_MINIMAL", "1")
+      os.environ.setdefault("AMD_BOOT_SMC_SKIP_DRAM", "1")
+      os.environ.setdefault("AMD_BOOT_LOADUCODES_UNTRAINED", "1")
+      print("polaris: SDMA ucode via SMC LoadUcodes (AGP TOC, mask=SDMA0|1)",
+            flush=True)
+      self.sdma_enable(False)
+      self.load_ip_firmware()
+      self._sdma_fw_resident = True
+    else:
+      self.load_sdma_firmware_only(unhalt=False)
 
   def disable_vga_dce(self):
     """gmc_v8_0_mc_program VGA lockout + dce_v8_0_disable_dce CRTC master off.
@@ -1116,35 +1162,57 @@ class PolarisBoot:
     return bytes(out)
 
   def probe_bar0_writes(self) -> bool:
-    """Return True if BAR0 framebuffer writes are visible (needed for VRAM path)."""
+    """True only if BAR0 writes survive HDP flush (posted writeback is a false positive).
+
+    TinyGPU BAR0 often latches the last write in the CPU mapping; after
+    hdp_flush/invalidate the same offset returns open-bus garbage (session #15:
+    constant 0xbde1aebe) while MC_SEQ_STATUS_M lacks CMD_RDY — GDDR path dead."""
     pat = 0xA5A5A5A5
     off = 0x2000
     try:
       self.dev.vram[off:off + 4] = struct.pack('<I', pat)
+      if struct.unpack('<I', bytes(self.dev.vram[off:off + 4]))[0] != pat:
+        return False
+      self.hdp_flush()
+      self.hdp_invalidate()
       got = struct.unpack('<I', bytes(self.dev.vram[off:off + 4]))[0]
       return got == pat
     except Exception:
       return False
 
   def probe_vram_mm_writes(self) -> bool:
-    """Return True if MM_INDEX VRAM writes work (Linux fallback when BAR0 is dead)."""
+    """True only if MM_INDEX VRAM writes survive HDP flush (same latch trap as BAR0)."""
     pat = 0xA5A5A5A5
-    offs = [0x3000, 0x10000, self.vram_visible_mc - self.vram_start + 0x3000]
+    offs = [0x3000, 0x10000]
+    if self.vram_start and self.vram_visible_mc:
+      offs.append((self.vram_visible_mc - self.vram_start + 0x3000) & 0xffffffff)
     for off in offs:
       off &= 0xffffffff
       mc = self.vram_mc_addr(off)
       try:
         self.vram_mm_write(mc, struct.pack('<I', pat))
+        # Immediate read can return the MM_DATA write latch — require flush.
+        self.hdp_flush()
+        self.hdp_invalidate()
         got = struct.unpack('<I', self.vram_mm_read(mc, 4))[0]
         ok = got == pat
         if int(os.environ.get("DEBUG", "0")):
-          print(f"polaris: probe_vram_mm off={off:#x} mc={mc:#x} wrote={pat:#x} read={got:#x} ok={ok}", flush=True)
+          print(f"polaris: probe_vram_mm off={off:#x} mc={mc:#x} wrote={pat:#x} "
+                f"read={got:#x} ok={ok}", flush=True)
         if ok:
           return True
       except Exception as e:
         if int(os.environ.get("DEBUG", "0")):
           print(f"polaris: probe_vram_mm off={off:#x} failed: {e}", flush=True)
     return False
+
+  def vram_data_path_live(self) -> bool:
+    """CPU can persist a dword into GDDR (BAR0 or MM_INDEX)."""
+    return self.probe_bar0_writes() or self.probe_vram_mm_writes()
+
+  def mc_seq_cmd_ready(self) -> bool:
+    """MC_SEQ_STATUS_M CMD_RDY_D0|D1 — GDDR command interface accepting traffic."""
+    return bool(self.rreg(mmMC_SEQ_STATUS_M) & 0xc)
 
   def mc_init_locations(self):
     """Place VRAM / GART / AGP from CONFIG_MEMSIZE + MC_VM_FB_LOCATION (gmc_v8_0_mc_init).
@@ -1600,15 +1668,44 @@ class PolarisBoot:
     self.mmio_sync_safe()
 
   def _sdma_disable_auto_ctxsw(self):
-    """sdma_v3_0_ctx_switch_enable(false) — TrustOS: AUTO_CTXSW without RLC = silent stall.
+    """sdma_v3_0_ctx_switch_enable(false) — TrustOS session #16 critical fix.
 
-    Default TrustOS working baseline is TRAP only (0x1). Set AMD_BOOT_SDMA_ATC=1 to
-    also enable ATC_L1 (Linux ctxsw-disable path)."""
-    cntl = SDMA0_CNTL__TRAP_ENABLE_MASK
-    if os.environ.get("AMD_BOOT_SDMA_ATC", "0") == "1":
-      cntl |= SDMA0_CNTL__ATC_L1_ENABLE_MASK
+    Do NOT clobber SDMA0_CNTL to 0x1. TrustOS found that wiping preamble bits
+    (MC_RDREQ_CREDIT / MC_WRREQ_CREDIT / …) left RPTR_FETCH stuck at 0 forever;
+    preserving them and only clearing AUTO_CTXSW yielded CNTL≈0x08050402 and
+    RPTR_FETCH advanced. Linux likewise RMW: AUTO_CTXSW=0, ATC_L1=1.
+    AMD_BOOT_SDMA_CNTL=trap forces the old TRAP-only 0x1 (debug only)."""
+    mode = os.environ.get("AMD_BOOT_SDMA_CNTL", "preserve")
     for off in (0, SDMA1_REG_OFFSET):
+      if mode == "trap":
+        cntl = SDMA0_CNTL__TRAP_ENABLE_MASK
+        if os.environ.get("AMD_BOOT_SDMA_ATC", "0") == "1":
+          cntl |= SDMA0_CNTL__ATC_L1_ENABLE_MASK
+      else:
+        # Linux sdma_v3_0_ctx_switch_enable: preserve credits/preamble.
+        # Default AUTO_CTXSW=0 (TrustOS fetch-ok baseline). Linux gfx_resume
+        # enables it; AMD_BOOT_SDMA_AUTO_CTXSW=1 matches that.
+        cntl = self.rreg(mmSDMA0_CNTL + off)
+        if os.environ.get("AMD_BOOT_SDMA_AUTO_CTXSW", "0") == "1":
+          cntl |= SDMA0_CNTL__AUTO_CTXSW_ENABLE_MASK
+        else:
+          cntl &= ~SDMA0_CNTL__AUTO_CTXSW_ENABLE_MASK
+        # ATC_L1: Linux enables it; TrustOS sometimes cleared UTC_L1 for AGP
+        # physical addressing when WRITE_LINEAR stalled with MC_WR_IDLE=1.
+        # AMD_BOOT_SDMA_ATC=0 forces ATC_L1 off (default: on, matching Linux).
+        if os.environ.get("AMD_BOOT_SDMA_ATC", "1") == "1":
+          cntl |= SDMA0_CNTL__ATC_L1_ENABLE_MASK
+        else:
+          cntl &= ~SDMA0_CNTL__ATC_L1_ENABLE_MASK
+        if os.environ.get("AMD_BOOT_SDMA_TRAP", "0") == "1":
+          cntl |= SDMA0_CNTL__TRAP_ENABLE_MASK
+        else:
+          # TrustOS stable baseline kept TRAP off (TRAP=1 reintroduced MC0 fault).
+          cntl &= ~SDMA0_CNTL__TRAP_ENABLE_MASK
       self.wreg(mmSDMA0_CNTL + off, cntl)
+      if int(os.environ.get("DEBUG", "0")):
+        print(f"polaris: SDMA{off and 1 or 0}_CNTL={self.rreg(mmSDMA0_CNTL + off):#x} "
+              f"(mode={mode})", flush=True)
 
   def gmc_hw_init_for_dma(self):
     """Linux gmc_v8_0_hw_init minus VRAM-backed GART table: mc_program → MC ucode → VM.
@@ -1777,6 +1874,40 @@ class PolarisBoot:
     self.disable_gpu_interrupts("pre-sdma-ring")
     self._sdma_gfx_ring_disable()
     self._sdma_disable_auto_ctxsw()
+    # Session #19: after a successful retire, FREEZE can stick at 1 and the next
+    # probe never fetches (FETCH=0). Always clear before reprogramming.
+    for off in (0, SDMA1_REG_OFFSET):
+      frz = self.rreg(mmSDMA0_FREEZE + off)
+      if frz:
+        self.wreg(mmSDMA0_FREEZE + off, 0)
+        if int(os.environ.get("DEBUG", "0")):
+          print(f"polaris: cleared SDMA{off and 1 or 0} FREEZE was={frz:#x}", flush=True)
+    # Linux sdma_v3_0_init_golden_registers (polaris10_a11): CHICKEN + CLK + POWER.
+    # Missing CHICKEN_BITS=0x00810007 left execute stalled (PKT_RDY + MC_WR_IDLE)
+    # after fetch_ok on this eGPU — same STATUS TrustOS saw mid-debug.
+    for off in (0, SDMA1_REG_OFFSET):
+      chicken = self.rreg(mmSDMA0_CHICKEN_BITS + off)
+      chicken = (chicken & ~SDMA0_CHICKEN_BITS_MASK) | (
+          SDMA0_CHICKEN_BITS_GOLDEN & SDMA0_CHICKEN_BITS_MASK)
+      self.wreg(mmSDMA0_CHICKEN_BITS + off, chicken)
+      clk = self.rreg(mmSDMA0_CLK_CTRL + off)
+      self.wreg(mmSDMA0_CLK_CTRL + off, (clk & ~0xff000fff) | 0x0)
+      pwr = self.rreg(mmSDMA0_POWER_CNTL + off)
+      # Golden LS/DS/SD + delay (0x3c800). Also force MEM_POWER_OVERRIDE (bit8)
+      # like sdma_v3_0_update_sdma_medium_grain_light_sleep — keeps SDMA mem on.
+      pwr = (pwr & ~0x800) | SDMA0_POWER_CNTL_GOLDEN
+      if os.environ.get("AMD_BOOT_SDMA_MEM_PWR_OVR", "1") == "1":
+        pwr |= SDMA0_POWER_CNTL__MEM_POWER_OVERRIDE_MASK
+      self.wreg(mmSDMA0_POWER_CNTL + off, pwr)
+      if int(os.environ.get("DEBUG", "0")):
+        print(f"polaris: SDMA{off and 1 or 0} CHICKEN={self.rreg(mmSDMA0_CHICKEN_BITS + off):#x} "
+              f"CLK={self.rreg(mmSDMA0_CLK_CTRL + off):#x} "
+              f"POWER={self.rreg(mmSDMA0_POWER_CNTL + off):#x} "
+              f"FREEZE={self.rreg(mmSDMA0_FREEZE + off):#x}", flush=True)
+    # Linux sdma_v3_0_gfx_resume: TILING_CONFIG = gb_addr_config & 0x70
+    gb = self.rreg(mmGB_ADDR_CONFIG)
+    self.wreg(mmSDMA0_TILING_CONFIG, gb & 0x70)
+    self.wreg(mmSDMA0_TILING_CONFIG + SDMA1_REG_OFFSET, gb & 0x70)
     # Linux sdma_v3_0_gfx_resume: clear VIRTUAL_ADDR + APE1 for every VMID via SRBM.
     for vmid in range(AMDGPU_NUM_VMID):
       self.srbm_select(0, 0, 0, vmid)
@@ -1791,25 +1922,93 @@ class PolarisBoot:
     # Do NOT leave VBIOS RB_SWAP_ENABLE (bit 9) set — that is the 0x1017 stall
     # (endian-swap corrupts LE ring words). No RPTR writeback / wptr poll / doorbell:
     # only the ring fetch itself is a device→host read for this probe.
+    # RB_PRIV (bit 23): TrustOS marks REQUIRED for bare-metal without IOMMU —
+    # without it, PACKET_READY can stick with MC_WR_IDLE=1 and no host write.
+    # AMD_BOOT_SDMA_RB_PRIV=0 disables (Linux gfx_resume does not set it).
     rb_cntl = ((rb_bufsz << SDMA0_GFX_RB_CNTL__RB_SIZE__SHIFT) &
                SDMA0_GFX_RB_CNTL__RB_SIZE_MASK)
     rb_cntl = _reg_set_field(rb_cntl, SDMA0_GFX_RB_CNTL__RPTR_WRITEBACK_TIMER_MASK,
                              SDMA0_GFX_RB_CNTL__RPTR_WRITEBACK_TIMER__SHIFT, 3)
+    if os.environ.get("AMD_BOOT_SDMA_RB_PRIV", "1") == "1":
+      rb_cntl |= SDMA0_GFX_RB_CNTL__RB_PRIV_MASK
     self.wreg(mmSDMA0_GFX_RB_CNTL, rb_cntl)  # RB_ENABLE=0 while programming
     self.wreg(mmSDMA0_GFX_RB_RPTR, 0)
     self.wreg(mmSDMA0_GFX_RB_WPTR, 0)
-    self.wreg(mmSDMA0_GFX_RB_RPTR_ADDR_HI, 0)
-    self.wreg(mmSDMA0_GFX_RB_RPTR_ADDR_LO, 0)
+    # Linux gfx_resume always programs RPTR_ADDR + RPTR_WRITEBACK_ENABLE=1.
+    # TrustOS also needs WB for RB_RPTR publish. Default ON with AGP/GART page;
+    # AMD_BOOT_SDMA_RPTR_WB=0 disables (old probe baseline).
+    self._sdma_rptr_wb_va = None
+    self._sdma_rptr_wb_mem = None
+    rptr_wb = os.environ.get("AMD_BOOT_SDMA_RPTR_WB", "1") == "1"
+    if rptr_wb:
+      try:
+        if getattr(self, "_probe_use_agp", False):
+          wb_va, wb_mem, _ = self.alloc_agp_buffer(PAGE_SIZE)
+        else:
+          wb_va, wb_mem, _ = self.alloc_gtt_buffer(PAGE_SIZE)
+        for i in range(PAGE_SIZE // 4):
+          wb_mem[i * 4:(i + 1) * 4] = struct.pack('<I', 0xDEADBEEF)
+        from add import sysmem_dma_flush
+        sysmem_dma_flush(wb_mem, PAGE_SIZE)
+        self.wreg(mmSDMA0_GFX_RB_RPTR_ADDR_HI, (wb_va >> 32) & 0xffffffff)
+        self.wreg(mmSDMA0_GFX_RB_RPTR_ADDR_LO, wb_va & 0xfffffffc)
+        rb_cntl |= SDMA0_GFX_RB_CNTL__RPTR_WRITEBACK_ENABLE_MASK
+        self._sdma_rptr_wb_va = wb_va
+        self._sdma_rptr_wb_mem = wb_mem
+      except Exception as e:
+        if int(os.environ.get("DEBUG", "0")):
+          print(f"polaris: RPTR_WB alloc failed: {e}", flush=True)
+        self.wreg(mmSDMA0_GFX_RB_RPTR_ADDR_HI, 0)
+        self.wreg(mmSDMA0_GFX_RB_RPTR_ADDR_LO, 0)
+    else:
+      self.wreg(mmSDMA0_GFX_RB_RPTR_ADDR_HI, 0)
+      self.wreg(mmSDMA0_GFX_RB_RPTR_ADDR_LO, 0)
     self.wreg(mmSDMA0_GFX_RB_WPTR_POLL_CNTL,
               self.rreg(mmSDMA0_GFX_RB_WPTR_POLL_CNTL) & ~SDMA0_GFX_RB_WPTR_POLL_CNTL__ENABLE_MASK)
-    self.wreg(mmSDMA0_GFX_DOORBELL,
-              self.rreg(mmSDMA0_GFX_DOORBELL) & ~SDMA0_GFX_DOORBELL__ENABLE_MASK)
+    # TrustOS: Linux doorbell OFFSET|ENABLE (0x100001E0) stopped init MC0 faults
+    # even when doorbell mailbox is dead — F32 may require the OFFSET field.
+    # Default: ENABLE=0 but write Linux-like OFFSET. AMD_BOOT_SDMA_DOORBELL=linux|0|1
+    door_mode = os.environ.get("AMD_BOOT_SDMA_DOORBELL", "linux")
+    door = self.rreg(mmSDMA0_GFX_DOORBELL)
+    if door_mode == "1":
+      door = (door & ~0x3ff) | 0x1e0 | SDMA0_GFX_DOORBELL__ENABLE_MASK
+    elif door_mode == "linux":
+      # OFFSET=0x1e0, ENABLE=0 — matches TrustOS "doorbell Linux values" without
+      # waiting for a doorbell ring that never comes on TinyGPU.
+      door = (door & ~0x3ff) | 0x1e0
+      door &= ~SDMA0_GFX_DOORBELL__ENABLE_MASK
+    else:
+      door &= ~SDMA0_GFX_DOORBELL__ENABLE_MASK
+    self.wreg(mmSDMA0_GFX_DOORBELL, door)
     self.wreg(mmSDMA0_GFX_RB_BASE, ring_gpu_va >> 8)
     self.wreg(mmSDMA0_GFX_RB_BASE_HI, (ring_gpu_va >> 40) & 0xffffffff)
+    # TrustOS: IB_ENABLE=1 (0x101) reintroduced SDM0 MC0 fault; stable baseline IB=0.
+    # Linux golden_settings_polaris10_a11: IB_CNTL mask→0x100 (SWITCH_INSIDE_IB only,
+    # IB_ENABLE=0). Full gfx_resume later sets IB_ENABLE=1; ring_test only needs RB.
+    # AMD_BOOT_SDMA_IB=1 enables IB; =golden (default) applies 0x100; =0 clears all.
+    ib_mode = os.environ.get("AMD_BOOT_SDMA_IB", "golden")
     ib_cntl = self.rreg(mmSDMA0_GFX_IB_CNTL)
-    ib_cntl = _reg_set_field(ib_cntl, SDMA0_GFX_IB_CNTL__IB_ENABLE_MASK,
-                             SDMA0_GFX_IB_CNTL__IB_ENABLE__SHIFT, 1)
+    if ib_mode == "1":
+      ib_cntl = _reg_set_field(ib_cntl, SDMA0_GFX_IB_CNTL__IB_ENABLE_MASK,
+                               SDMA0_GFX_IB_CNTL__IB_ENABLE__SHIFT, 1)
+    elif ib_mode == "golden":
+      ib_cntl = (ib_cntl & ~0x800f0111) | 0x00000100
+    else:
+      ib_cntl &= ~SDMA0_GFX_IB_CNTL__IB_ENABLE_MASK
+      ib_cntl &= ~0x100  # SWITCH_INSIDE_IB
     self.wreg(mmSDMA0_GFX_IB_CNTL, ib_cntl)
+    # PHASE*_QUANTUM: Linux leaves 0 unless amdgpu_sdma_phase_quantum is set.
+    # TrustOS: non-zero (0x2000) reintroduced MC0 faults. Live eGPU (session #19):
+    # PHASE=0 → EXPIRED=1; PHASE=0xff0f clears EXPIRED and (with RPTR_WB +
+    # MEM_POWER_OVERRIDE + doorbell OFFSET) allows F32 execute/retire.
+    # AMD_BOOT_SDMA_PHASE=0|leave|<hex> (default 0xff0f after write_ok).
+    phase_mode = os.environ.get("AMD_BOOT_SDMA_PHASE", "0xff0f")
+    if phase_mode != "leave":
+      phase = int(phase_mode, 0)
+      self.wreg(0x3414, phase)
+      self.wreg(0x3415, phase)
+      self.wreg(0x3614, phase)
+      self.wreg(0x3615, phase)
     rb_cntl = _reg_set_field(rb_cntl, SDMA0_GFX_RB_CNTL__RB_ENABLE_MASK,
                              SDMA0_GFX_RB_CNTL__RB_ENABLE__SHIFT, 1)
     self.wreg(mmSDMA0_GFX_RB_CNTL, rb_cntl)
@@ -1856,15 +2055,24 @@ class PolarisBoot:
         "SDMA device-DMA probe gated — set AMD_BOOT_SDMA_PROBE=1 (APCIE panic risk)")
     from add import sysmem_dma_flush
     use_agp = os.environ.get("AMD_BOOT_SDMA_AGP", "0") == "1"
+    self._probe_use_agp = use_agp
     if not self.sdma_fw_resident():
       raise RuntimeError(
         "SDMA ucode not resident — run: python3 add.py --boot-stage=fw-sdma first "
         "(this probe unhalts SDMA itself once the ring is programmed).")
     use_vram = os.environ.get("AMD_BOOT_SDMA_VRAM", "0") == "1"
+    pkt_mode = os.environ.get("AMD_BOOT_SDMA_PKT", "write")  # write|srbm|nop
     if use_vram:
-      # Isolation test: ring+dst in VRAM (no host DMA). If rptr advances, SDMA
-      # itself works and the wall is device→host reads. BAR0 may be dead for
-      # CPU readback — success is rptr_dw >= wptr_dw.
+      # Isolation test: ring+dst in VRAM (no host DMA). HARD GATE: if the CPU
+      # cannot persist a dword into GDDR, RB_BASE at 0xf4… is not real VRAM —
+      # MC may route it out PCIe as a ≥32-bit TLP → apciec 0x200000 (panic #15).
+      if not self.vram_data_path_live():
+        st = self.rreg(mmMC_SEQ_STATUS_M)
+        raise RuntimeError(
+          f"AMD_BOOT_SDMA_VRAM=1 refused: VRAM data path dead "
+          f"(BAR0/MM_INDEX writes vanish after HDP flush; "
+          f"MC_SEQ_STATUS_M={st:#x} CMD_RDY={bool(st & 0xc)}). "
+          f"Use AMD_BOOT_SDMA_AGP=1 (host ring via AGP) instead.")
       self.gmc_sw_init()
       self.mc_program_apertures()
       self.mc_setup_tlb_apertures()
@@ -1907,72 +2115,195 @@ class PolarisBoot:
     # Program ring while F32 halted, preload WPTR, then unhalt — so the first
     # fetch already has work (Linux commits after enable; USB4 prefers preload).
     self._sdma_gfx_ring_setup(ring_va, SDMA_RING_SIZE, unhalt=False)
-    # sdma_v2_4_ring_test_ring: 5-dword WRITE_LINEAR packet
-    pkt = [
-      _sdma_pkt_hdr(SDMA_OP_WRITE, SDMA_SUBOP_WRITE_LINEAR),
-      dst_va & 0xffffffff,
-      (dst_va >> 32) & 0xffffffff,
-      1,  # SDMA_PKT_WRITE_UNTILED_DW_3_COUNT(1)
-      expect,
-    ]
-    self._sdma_gfx_ring_commit(ring_mem, pkt, ring_va=ring_va if use_vram else None)
+    # Optional: write into the ring page itself (same AGP mapping as fetch) to
+    # isolate dst-aperture issues. AMD_BOOT_SDMA_DST=ring → ring_va+0x100.
+    dst_mode = os.environ.get("AMD_BOOT_SDMA_DST", "buf")
+    dst_off = 0
+    if dst_mode == "ring" and not use_vram and ring_mem is not None:
+      dst_va = ring_va + 0x100
+      dst_mem = ring_mem
+      dst_off = 0x100
+      ring_mem[dst_off:dst_off + 4] = struct.pack('<I', sentinel)
+      sysmem_dma_flush(ring_mem, SDMA_RING_SIZE)
+      if use_agp:
+        dst_paddrs = [dst_va - self.agp_start]
+      else:
+        dst_paddrs = [dst_va]
+    # Packet modes:
+    #   write (default): WRITE_LINEAR → host (needs host DMA write path)
+    #   srbm: SRBM_WRITE → GFX_DUMMY_REG (on-chip; proves F32 execute w/o host DMA)
+    #   nop:  NOP only (proves retire / RPTR advance)
+    count_field = int(os.environ.get("AMD_BOOT_SDMA_COUNT", "1"))
+    dummy_expect = 0xA5A5A5A5
+    if pkt_mode == "srbm":
+      self.wreg(mmSDMA0_GFX_DUMMY_REG, 0)
+      pkt = [
+        _sdma_pkt_hdr(SDMA_OP_SRBM_WRITE, 0, byte_en=0xf),
+        mmSDMA0_GFX_DUMMY_REG & 0xffff,
+        dummy_expect,
+      ]
+    elif pkt_mode == "nop":
+      pkt = [0]  # single NOP
+    else:
+      pkt = [
+        _sdma_pkt_hdr(SDMA_OP_WRITE, SDMA_SUBOP_WRITE_LINEAR),
+        dst_va & 0xffffffff,
+        (dst_va >> 32) & 0xffffffff,
+        count_field,
+        expect,
+      ]
+    # TrustOS: NOP first then WRITE — F32 must see a trivial packet before WRITE_LINEAR.
+    # Session #18: also pad trailing NOPs so speculative ring prefetch past the
+    # packet does not leave RB_MC_RREQ outstanding on garbage (FETCH still advances
+    # through NOPs; execute/retire remains the blocker).
+    nop_first = os.environ.get("AMD_BOOT_SDMA_NOP_FIRST", "1") == "1"
+    nop_pad = int(os.environ.get("AMD_BOOT_SDMA_NOP_PAD", "32"))
+    if pkt_mode == "nop":
+      full = pkt + ([0] * max(0, nop_pad))
+    else:
+      full = ([0] if nop_first else []) + pkt + ([0] * max(0, nop_pad))
+    self._sdma_gfx_ring_commit(ring_mem, full,
+                               ring_va=ring_va if (use_vram and ring_mem is None) else None)
+    wptr_dwords = len(full)
     if not self.sdma_fw_ready():
       self.sdma_enable(True)
+      self.wreg(mmSDMA0_GFX_CONTEXT_CNTL, 0)
+      # F32 may rewrite CNTL/CONTEXT on unhalt — re-apply TrustOS baseline.
+      self._sdma_disable_auto_ctxsw()
       self.wreg(mmSDMA0_GFX_CONTEXT_CNTL, 0)
       self.mmio_sync_safe()
     timeout_s = float(os.environ.get("AMD_BOOT_SDMA_PROBE_TIMEOUT_S", "5"))
     deadline = time.time() + timeout_s
     write_ok = False
+    srbm_ok = False
     last_val = sentinel
     while time.time() < deadline:
-      if dst_mem is not None:
-        last_val = struct.unpack('<I', bytes(dst_mem[0:4]))[0]
+      if pkt_mode == "srbm":
+        dummy = self.rreg(mmSDMA0_GFX_DUMMY_REG)
+        if dummy == dummy_expect:
+          srbm_ok = True
+          write_ok = True
+          last_val = dummy
+          break
+        last_val = dummy
+      elif pkt_mode == "nop":
+        rptr_now = self.rreg(mmSDMA0_GFX_RB_RPTR) >> 2
+        if rptr_now >= 1:
+          write_ok = True
+          last_val = rptr_now
+          break
       else:
-        # VRAM dst — try MM_INDEX readback (may be garbage if BAR/MM dead)
-        with contextlib.suppress(Exception):
-          last_val = struct.unpack('<I', self.vram_mm_read(dst_va, 4))[0]
-      if last_val == expect:
+        if dst_mem is not None:
+          last_val = struct.unpack('<I', bytes(dst_mem[dst_off:dst_off + 4]))[0]
+        else:
+          with contextlib.suppress(Exception):
+            last_val = struct.unpack('<I', self.vram_mm_read(dst_va, 4))[0]
+        if last_val == expect:
+          write_ok = True
+          break
+      # Session #16: RPTR_FETCH advance proves host ring READ works (partial win).
+      fetch = self.rreg(0x340a)
+      if pkt_mode == "write" and fetch >= (wptr_dwords << 2) and last_val == expect:
         write_ok = True
         break
-      # VRAM isolation: rptr advance alone proves SDMA executed
-      if use_vram and (self.rreg(mmSDMA0_GFX_RB_RPTR) >> 2) >= len(pkt):
+      if use_vram and (self.rreg(mmSDMA0_GFX_RB_RPTR) >> 2) >= wptr_dwords:
         write_ok = True
         break
       time.sleep(0.001)
     rptr = self.rreg(mmSDMA0_GFX_RB_RPTR) >> 2
-    wptr = len(pkt)
+    wptr = wptr_dwords
     status = self.rreg(mmSDMA0_STATUS_REG)
+    status2 = self.rreg(mmSDMA0_STATUS2_REG)
+    # TrustOS diag: internal fetch ptr can move while RB_RPTR stays 0.
+    rptr_fetch = self.rreg(0x340a)  # mmSDMA0_RB_RPTR_FETCH
+    fetch_ok = rptr_fetch >= (wptr << 2)
+    f32_ip = (status2 & SDMA0_STATUS2_REG__F32_INSTR_PTR_MASK) >> SDMA0_STATUS2_REG__F32_INSTR_PTR__SHIFT
+    cmd_op = (status2 & SDMA0_STATUS2_REG__CMD_OP_MASK) >> SDMA0_STATUS2_REG__CMD_OP__SHIFT
     result = {
       **pte,
       "ring_va": ring_va,
       "dst_va": dst_va,
       "dst_paddr": dst_paddrs[0],
       "write_ok": write_ok,
+      "srbm_ok": srbm_ok,
+      "pkt_mode": pkt_mode,
+      "fetch_ok": fetch_ok,
       "dst_value": last_val,
-      "expect": expect,
+      "expect": expect if pkt_mode == "write" else (dummy_expect if pkt_mode == "srbm" else 1),
       "rptr_dw": rptr,
       "wptr_dw": wptr,
+      "rptr_fetch": rptr_fetch,
       "ring_drained": rptr >= wptr,
       "f32_cntl": self.rreg(mmSDMA0_F32_CNTL),
       "rb_cntl": self.rreg(mmSDMA0_GFX_RB_CNTL),
+      "sdma_cntl": self.rreg(mmSDMA0_CNTL),
+      "ib_cntl": self.rreg(mmSDMA0_GFX_IB_CNTL),
+      "context_cntl": self.rreg(mmSDMA0_GFX_CONTEXT_CNTL),
       "status_reg": status,
+      "status2": status2,
+      "f32_instr_ptr": f32_ip,
+      "cmd_op": cmd_op,
+      "power_cntl": self.rreg(mmSDMA0_POWER_CNTL),
+      "freeze": self.rreg(mmSDMA0_FREEZE),
+      "dummy_reg": self.rreg(mmSDMA0_GFX_DUMMY_REG),
+      "doorbell": self.rreg(mmSDMA0_GFX_DOORBELL),
       "agp_start": self.agp_start,
       "vram_start": self.vram_start,
+      "sys_apr_lo": self.rreg(mmMC_VM_SYSTEM_APERTURE_LOW_ADDR),
+      "sys_apr_hi": self.rreg(mmMC_VM_SYSTEM_APERTURE_HIGH_ADDR),
+      "sys_apr_def": self.rreg(mmMC_VM_SYSTEM_APERTURE_DEFAULT_ADDR),
     }
+    if self._sdma_rptr_wb_mem is not None:
+      result["rptr_wb"] = struct.unpack('<I', bytes(self._sdma_rptr_wb_mem[0:4]))[0]
+    else:
+      result["rptr_wb"] = None
     result["engine_idle"] = bool(status & SDMA0_STATUS_REG__IDLE_MASK)
     result["mc_rd_idle"] = bool(status & SDMA0_STATUS_REG__MC_RD_IDLE_MASK)
     result["rb_mc_rreq_idle"] = bool(status & 0x20000)  # RB_MC_RREQ_IDLE
     result["mc_rd_ret_stall"] = bool(status & 0x200000)  # MC_RD_RET_STALL
-    print(f"sdma_probe write_ok={write_ok} dst={last_val:#x} expect={expect:#x} "
-          f"rptr_dw={rptr} wptr_dw={wptr} ring_drained={result['ring_drained']} "
+    result["packet_ready"] = bool(status & (1 << 12))
+    result["ex_idle"] = bool(status & (1 << 10))
+    result["mc_wr_idle"] = bool(status & (1 << 13))
+    # oss_3_0: bit22 = MC_RD_NO_POLL_IDLE (idle flag), NOT a write-return stall.
+    result["mc_rd_no_poll_idle"] = bool(status & (1 << 22))
+    result["ctx_status"] = self.rreg(0x3491)  # mmSDMA0_GFX_CONTEXT_STATUS
+    result["ctx_expired"] = bool(result["ctx_status"] & 0x8)
+    result["ctx_selected"] = bool(result["ctx_status"] & 0x1)
+    result["rb_priv"] = bool(result["rb_cntl"] & SDMA0_GFX_RB_CNTL__RB_PRIV_MASK)
+    result["chicken"] = self.rreg(mmSDMA0_CHICKEN_BITS)
+    result["phase0"] = self.rreg(0x3414)
+    print(f"sdma_probe pkt={pkt_mode} write_ok={write_ok} srbm_ok={srbm_ok} "
+          f"dst={last_val:#x} expect={result['expect']:#x} "
+          f"rptr_dw={rptr} wptr_dw={wptr} fetch={rptr_fetch:#x} "
+          f"ring_drained={result['ring_drained']} "
           f"ring_va={ring_va:#x} dst_paddr={dst_paddrs[0]:#x} "
           f"vram={self.vram_start:#x} agp={self.agp_start:#x} "
-          f"status={status:#x} idle={result['engine_idle']} "
+          f"CNTL={result['sdma_cntl']:#x} RB={result['rb_cntl']:#x} "
+          f"RB_PRIV={result['rb_priv']} CTX={result['context_cntl']:#x} "
+          f"IB={result['ib_cntl']:#x} DOOR={result['doorbell']:#x} "
+          f"status={status:#x} ST2={status2:#x} IP={f32_ip} CMD={cmd_op:#x} "
+          f"POWER={result['power_cntl']:#x} FRZ={result['freeze']:#x} "
+          f"DUMMY={result['dummy_reg']:#x} "
+          f"idle={result['engine_idle']} "
+          f"PKT_RDY={result['packet_ready']} EX_IDLE={result['ex_idle']} "
+          f"MC_WR_IDLE={result['mc_wr_idle']} "
           f"mc_rd_idle={result['mc_rd_idle']} rb_rreq_idle={result['rb_mc_rreq_idle']} "
-          f"rd_ret_stall={result['mc_rd_ret_stall']}", flush=True)
+          f"rd_ret_stall={result['mc_rd_ret_stall']} "
+          f"CTX={result['ctx_status']:#x} EXP={result['ctx_expired']} "
+          f"CHICKEN={result['chicken']:#x} PHASE0={result['phase0']:#x} "
+          f"RPTR_WB={result['rptr_wb']} "
+          f"SYS_APR={result['sys_apr_lo']:#x}/{result['sys_apr_hi']:#x}/{result['sys_apr_def']:#x}",
+          flush=True)
     if not write_ok:
-      print("sdma_probe: WRITE_LINEAR did not update dst — ring fetch or host DMA failed",
-            flush=True)
+      if pkt_mode == "srbm":
+        print("sdma_probe: SRBM_WRITE did not update DUMMY_REG — F32 execute stuck",
+              flush=True)
+      elif pkt_mode == "nop":
+        print("sdma_probe: NOP did not advance RB_RPTR — F32 retire stuck",
+              flush=True)
+      else:
+        print("sdma_probe: WRITE_LINEAR did not update dst — execute or host DMA failed",
+              flush=True)
       # Outstanding ring-fetch (RB_MC_RREQ_IDLE=0) or MC_RD_RET_STALL — soft-reset
       # so a wedged completion cannot trip delayed apciec panics.
       if not result["rb_mc_rreq_idle"] or result["mc_rd_ret_stall"] or not result["mc_rd_idle"]:

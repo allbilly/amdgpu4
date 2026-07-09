@@ -813,14 +813,24 @@ class PolarisDevice:
           if b.gart_pte_mem is None:
             b.gart_enable()
       else:
-        # Cold GPU: ATOM asic_init (default) + gmc_hw_init_for_dma + SDMA ucode only.
-        # No SMC, no RLC/CP/MEC. Default GART table in VRAM (Linux/TrustOS) so the
-        # walker never DMA-reads host; ring/dst still map to host via SYSTEM PTEs.
-        os.environ.setdefault("AMD_BOOT_GART_SYSMEM", "0")
+        # Cold GPU: ATOM + gmc_hw_init_for_dma + SDMA ucode. VRAM data path is dead
+        # on this eGPU (CMD_RDY=0), so default GART PTE table to host sysmem via AGP
+        # MC base (session #14/#15). Override with AMD_BOOT_GART_SYSMEM=0 only if
+        # BAR0/MM VRAM writes actually survive HDP flush.
+        os.environ.setdefault("AMD_BOOT_GART_SYSMEM", "1")
         b.boot_sdma_minimal()
       r = b.probe_sdma_dma()
-      print(f"stage=sdma-probe mode={r.get('mode')} write_ok={r['write_ok']} "
+      print(f"stage=sdma-probe mode={r.get('mode')} pkt={r.get('pkt_mode')} "
+            f"write_ok={r['write_ok']} srbm_ok={r.get('srbm_ok')} "
+            f"fetch_ok={r.get('fetch_ok')} fetch={r.get('rptr_fetch', 0):#x} "
             f"ring_drained={r['ring_drained']} dst={r['dst_value']:#x} "
+            f"CNTL={r.get('sdma_cntl', 0):#x} RB_PRIV={r.get('rb_priv')} "
+            f"PKT_RDY={r.get('packet_ready')} EX_IDLE={r.get('ex_idle')} "
+            f"MC_WR_IDLE={r.get('mc_wr_idle')} EXP={r.get('ctx_expired')} "
+            f"CTX={r.get('ctx_status', 0):#x} PHASE0={r.get('phase0', 0):#x} "
+            f"ST2={r.get('status2', 0):#x} IP={r.get('f32_instr_ptr')} "
+            f"CMD={r.get('cmd_op', 0):#x} POWER={r.get('power_cntl', 0):#x} "
+            f"DUMMY={r.get('dummy_reg', 0):#x} "
             f"F32_CNTL={b.rreg(mmSDMA0_F32_CNTL):#x}")
       return
     if stage == "kcq-direct":
@@ -930,13 +940,16 @@ def probe():
   print(f"SMC running={boot.smc_running()} PC={boot.smc_rreg(ixSMC_PC_C):#x} "
         f"FLAGS={boot.smc_rreg(ixFIRMWARE_FLAGS):#x} RESP={dev.mmio[0x95]:#x}")
   print(f"CONFIG_MEMSIZE={boot.rreg(0x150a):#x} MC_VM_FB_LOCATION={boot.rreg(0x809):#x}")
+  st_m = boot.rreg(0xa91)
+  print(f"MC_SEQ_STATUS_M={st_m:#x} CMD_RDY={bool(st_m & 0xc)} "
+        f"(GDDR live only if CMD_RDY; PWRUP alone is not enough)")
   bar0_ok = boot.probe_bar0_writes()
-  print(f"BAR0 writes={'ok' if bar0_ok else 'FAIL'}")
+  print(f"BAR0 writes={'ok' if bar0_ok else 'FAIL'} (strict: survives HDP flush)")
   if getenv("AMD_PROBE_MC", 0):
     boot.gmc_sw_init()
     boot.mc_program()
     mm_ok = boot.probe_vram_mm_writes()
-    print(f"MM_INDEX VRAM writes={'ok' if mm_ok else 'FAIL'}")
+    print(f"MM_INDEX VRAM writes={'ok' if mm_ok else 'FAIL'} (strict: survives HDP flush)")
   with contextlib.suppress(Exception):
     mem, paddrs, _ = boot.alloc_sysmem_buffer(0x1000, contiguous=True)
     if paddrs:
