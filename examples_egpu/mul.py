@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
-"""Standalone AMD RX570 (Polaris10 / gfx803) eGPU vector-add over TinyGPU.app on macOS.
+"""Standalone AMD RX570 (Polaris10 / gfx803) eGPU vector-mul over TinyGPU.app on macOS.
 
 Vendored single-file (nvgpu examples/add.py style): TinyGPU transport + ATOM BIOS
-interpreter + Polaris boot/ComputeQueue + PM4 vector-add. No runtime import of
+interpreter + Polaris boot/ComputeQueue + PM4 vector-mul. No runtime import of
 polaris_boot / atom_replay.
 
 Usage:
@@ -498,9 +498,9 @@ def build_shader(alu_op: int) -> bytes:
   w += [Op.S_WAITCNT_VM0_LGKM0, Op.S_ENDPGM]
   return Gcn3.words_blob(w)
 
-ALU_OP = Gcn3.Op.V_ADD_F32
-OP = lambda x, y: x + y
-OP_NAME = "add"
+ALU_OP = Gcn3.Op.V_MUL_F32
+OP = lambda x, y: x * y
+OP_NAME = "mul"
 ADD_SHADER = build_shader(ALU_OP)
 PKT3_EVENT_WRITE = 0x46
 EVENT_TYPE_CS_PARTIAL_FLUSH = 7
@@ -5613,7 +5613,7 @@ def selftest():
   ib = PM4Builder().build_dispatch_ib(0x10000, 0x20000, 0x30000, 0x40000)
   assert len(ADD_SHADER) == 200
   assert ADD_SHADER == build_shader(ALU_OP)
-  assert build_shader(Gcn3.Op.V_MUL_F32) != ADD_SHADER
+  assert build_shader(Gcn3.Op.V_ADD_F32) != ADD_SHADER
   assert len(ib) >= 20
   assert ib[0] >> 30 == PKT_TYPE3
   set_pkt = [pkt3(PACKET3_SET_RESOURCES, 6), 0, 1, 0, 0, 0, 0, 0]

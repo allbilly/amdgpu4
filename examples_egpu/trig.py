@@ -1,19 +1,18 @@
 #!/usr/bin/env python3
-"""Standalone AMD RX570 (Polaris10 / gfx803) eGPU vector-add over TinyGPU.app on macOS.
+"""Standalone AMD RX570 (Polaris10 / gfx803) eGPU triangle raster over TinyGPU.app on macOS.
+Reference: examples/radv_triangle.c (256x256 red triangle → triangle.ppm).
 
 Vendored single-file (nvgpu examples/add.py style): TinyGPU transport + ATOM BIOS
-interpreter + Polaris boot/ComputeQueue + PM4 vector-add. No runtime import of
+interpreter + Polaris boot/ComputeQueue + PM4 compute triangle raster (same verts as radv_triangle). No runtime import of
 polaris_boot / atom_replay.
 
 Usage:
-  python3 examples_egpu/add.py                  # vector-add (session #21 proven path)
-  python3 examples_egpu/add.py --probe          # eGPU + register sanity (no boot)
-  python3 examples_egpu/add.py --selftest         # offline PM4 + shader gate
-  python3 examples_egpu/add.py --reset           # auto reset (AMD cfg if PCI up, else PCI hot reset)
-  python3 examples_egpu/add.py --boot-stage=add  # same as bare run
-  python3 examples_egpu/add.py --boot-stage=kcq-ring-test
-  python3 examples_egpu/add.py --boot-stage=sdma-probe
-  AMD_BOOT_SAFE=1 python3 examples_egpu/add.py  # print stage help only (old gated default)
+  python3 examples_egpu/trig.py                  # raster → triangle.ppm
+  python3 examples_egpu/trig.py --out=/tmp/t.ppm
+  python3 examples_egpu/trig.py --probe          # eGPU + register sanity (no boot)
+  python3 examples_egpu/trig.py --selftest       # offline PM4 + host raster gate
+  python3 examples_egpu/trig.py --reset
+  python3 examples_egpu/trig.py --boot-stage=trig
 """
 from __future__ import annotations
 import os, sys, ctypes, ctypes.util, time, mmap, struct, array, socket, subprocess
@@ -417,91 +416,20 @@ PKT3_PFP_SYNC_ME = 0x23
 DISPATCH_INITIATOR_COMPUTE_SHADER_EN = 1 << 0
 DISPATCH_INITIATOR_FORCE_START_AT_000 = 1 << 2
 
-# gfx803 ISA (GCN3) — named encoders like nvgpu CubinHelper / build_cubin.
-# User SGPRs: s[0:1]=out, s[2:3]=a, s[4:5]=b. VGPRs v0..v13 → RSRC1 VGPRS>=3.
-# VOP2: OP[30:25] | VSRC1[24:17] | SRC0[16:9] | VDST[8:0]
-class Gcn3:
-  class Reg:
-    V0, V1, V2, V3, V4, V5, V6, V7 = range(8)
-    V8, V9, V10, V11, V12, V13 = range(8, 14)
-    S0, S1, S2, S3, S4, S5 = range(6)
-
-  class Op:
-    V_ADD_F32 = 1
-    V_MUL_F32 = 5
-    V_ADD_U32 = 0x19
-    S_WAITCNT_VM0_LGKM0 = 0xBF8C0070
-    S_ENDPGM = 0xBF810000
-
-  @staticmethod
-  def words_blob(words):
-    return b"".join(struct.pack("<I", w) for w in words)
-
-  @staticmethod
-  def v_mov_b32(vd: int, src: int) -> int:
-    """VOP1 v_mov_b32: src = SGPR index, or 0x80|imm for inline constant."""
-    return 0x7E000200 | ((vd & 0xFF) << 17) | (src & 0x1FF)
-
-  @classmethod
-  def v_mov_b32_imm(cls, vd: int, imm: int) -> int:
-    return cls.v_mov_b32(vd, 0x80 | (imm & 0x7F))
-
-  @classmethod
-  def v_mov_b32_sgpr(cls, vd: int, s: int) -> int:
-    return cls.v_mov_b32(vd, s & 0xFF)
-
-  @staticmethod
-  def flat_load_dword(vd: int, vaddr: int) -> tuple[int, int]:
-    return (0xDC500000, ((vd & 0xFF) << 24) | (vaddr & 0xFF))
-
-  @staticmethod
-  def flat_store_dword(vaddr: int, vdata: int) -> tuple[int, int]:
-    return (0xDC700000, ((vdata & 0xFF) << 8) | (vaddr & 0xFF))
-
-  @staticmethod
-  def v_add_u32(vd: int, imm: int, vs1: int) -> int:
-    """v_add_u32 vd, vcc, imm, vs1 (inline imm lands in VDST field; matches llvm-mc)."""
-    return ((Gcn3.Op.V_ADD_U32 & 0x3F) << 25) | ((vs1 & 0xFF) << 17) | ((vd & 0x1FF) << 9) | (0x80 | (imm & 0x7F))
-
-  @staticmethod
-  def v_binop_f32(op6: int, vd: int, src0: int, vsrc1: int) -> int:
-    """v_{add,mul}_f32_e32 vd, src0, vsrc1 (VDST bit8 set; HW-proven blob encoding)."""
-    return ((op6 & 0x3F) << 25) | ((vsrc1 & 0xFF) << 17) | ((src0 & 0x1FF) << 9) | (0x100 | (vd & 0xFF))
-
-def build_shader(alu_op: int) -> bytes:
-  """4-wide float kernel: out[i] = a[i] OP b[i] via flat load/store (gfx803)."""
-  R, Op = Gcn3.Reg, Gcn3.Op
-  w: list[int] = []
-  # COMMON_PREFIX: byte offsets + load a[0..3]
-  w += [Gcn3.v_mov_b32_imm(i, 4 * i) for i in (R.V0, R.V1, R.V2, R.V3)]
-  w += [Gcn3.v_mov_b32_sgpr(R.V12, R.S2), Gcn3.v_mov_b32_sgpr(R.V13, R.S3)]
-  for vd in (R.V4, R.V5, R.V6, R.V7):
-    w += list(Gcn3.flat_load_dword(vd, R.V12))
-    if vd != R.V7:
-      w.append(Gcn3.v_add_u32(R.V12, 4, R.V12))
-  # load b[0..3]
-  w += [Gcn3.v_mov_b32_sgpr(R.V12, R.S4), Gcn3.v_mov_b32_sgpr(R.V13, R.S5)]
-  for vd in (R.V8, R.V9, R.V10, R.V11):
-    w += list(Gcn3.flat_load_dword(vd, R.V12))
-    if vd != R.V11:
-      w.append(Gcn3.v_add_u32(R.V12, 4, R.V12))
-  w.append(Op.S_WAITCNT_VM0_LGKM0)
-  # ARITHMETIC: v_op_f32 v{4+i}, v{8+i}, v{4+i}
-  for i in range(4):
-    w.append(Gcn3.v_binop_f32(alu_op, R.V4 + i, R.V8 + i, R.V4 + i))
-  # COMMON_SUFFIX: store out[0..3]
-  w += [Gcn3.v_mov_b32_sgpr(R.V12, R.S0), Gcn3.v_mov_b32_sgpr(R.V13, R.S1)]
-  for vd in (R.V4, R.V5, R.V6, R.V7):
-    w += list(Gcn3.flat_store_dword(R.V12, vd))
-    if vd != R.V7:
-      w.append(Gcn3.v_add_u32(R.V12, 4, R.V12))
-  w += [Op.S_WAITCNT_VM0_LGKM0, Op.S_ENDPGM]
-  return Gcn3.words_blob(w)
-
-ALU_OP = Gcn3.Op.V_ADD_F32
-OP = lambda x, y: x + y
-OP_NAME = "add"
-ADD_SHADER = build_shader(ALU_OP)
+# gfx803 compute triangle raster — same NDC verts as examples/radv_triangle.c
+# on a 256x256 RGBA8 framebuffer (one thread per pixel via TGID_X/Y).
+# s[0:1]=fb, s[2]=tgid.x, s[3]=tgid.y. USER_SGPR=2 + TGID_X/Y_EN.
+# Verts A(128,32) B(224,224) C(32,224); CW edge test; red 0xFF0000FF.
+# Assembled: llvm-mc -arch=amdgcn -mcpu=gfx803
+WIDTH, HEIGHT = 256, 256
+FB_BYTES = WIDTH * HEIGHT * 4
+TRIG_SHADER = bytes.fromhex(
+  "ff02147e80000000ff02167ec0000000ff02187e60000000ff021a7ee0000000a0021c7e0202007e0302027e00150434011d0634040085d202170200050085d203190200040b0c34011b0634070085d203170200001d0434040085d202170200011b0634050085d203190200040b0832800810346a00c3d006010100090000d18002a9016a00c3d0070101000a0000d18002a9016a00c3d0080101000b0000d18002a90109151226091712266a00cdd009010100ff02187eff0000ff801818008802022400030032820000240002047e0102067e02010432036a1cd10301a901000070dc020c000070008cbf000081bf"
+)
+OP_NAME = "trig"
+# COMPUTE_PGM_RSRC2: USER_SGPR=2 (bits[5:1]=2→0x4) | TGID_X_EN | TGID_Y_EN
+TRIG_RSRC1 = 0x000f0043  # VGPRS=3 (16), SGPRS=1 (16), FLOAT_MODE=0xf0
+TRIG_RSRC2 = 0x00000184
 PKT3_EVENT_WRITE = 0x46
 EVENT_TYPE_CS_PARTIAL_FLUSH = 7
 EVENT_INDEX_CS_PARTIAL_FLUSH = 4
@@ -538,13 +466,10 @@ class PM4Builder:
     self.pkt3(PKT3_DISPATCH_DIRECT, gx, gy, gz, initiator)
     self.words[-5] |= PACKET3_SHADER_TYPE_S
 
-  def build_dispatch_ib(self, shader_gpu_addr: int, out_va: int, a_va: int, b_va: int,
-                        rsrc1=0x000f0043, rsrc2=0x0000000c) -> list[int]:
-    """Build PM4 IB for 1x1x1 threadgroup, 4-wide float add.
-
-    COMPUTE_PGM_LO/HI are in 256-byte units (gfx_v8_0_do_edc_gpr_workarounds).
-    rsrc1: VGPRS=3 (16 VGPRs), SGPRS=1 (16 SGPRs), FLOAT_MODE=0xf0.
-    rsrc2: USER_SGPR=6 → bits[5:1]=6 → 0xc."""
+  def build_dispatch_ib(self, shader_gpu_addr: int, fb_va: int,
+                        rsrc1=TRIG_RSRC1, rsrc2=TRIG_RSRC2,
+                        width=WIDTH, height=HEIGHT) -> list[int]:
+    """PM4 IB: width×height×1 groups, 1 thread each — raster red triangle to RGBA8 fb."""
     self.words = []
     self.set_sh_reg(REG_COMPUTE_START_X, 0)
     self.set_sh_reg(REG_COMPUTE_START_Y, 0)
@@ -556,14 +481,9 @@ class PM4Builder:
     self.set_sh_reg_seq(REG_COMPUTE_PGM_LO, lo32(pgm), hi32(pgm))
     self.set_sh_reg(REG_COMPUTE_PGM_RSRC1, rsrc1)
     self.set_sh_reg(REG_COMPUTE_PGM_RSRC2, rsrc2)
-    self.set_sh_reg(REG_COMPUTE_USER_DATA_0 + 0, lo32(out_va))
-    self.set_sh_reg(REG_COMPUTE_USER_DATA_0 + 1, hi32(out_va))
-    self.set_sh_reg(REG_COMPUTE_USER_DATA_0 + 2, lo32(a_va))
-    self.set_sh_reg(REG_COMPUTE_USER_DATA_0 + 3, hi32(a_va))
-    self.set_sh_reg(REG_COMPUTE_USER_DATA_0 + 4, lo32(b_va))
-    self.set_sh_reg(REG_COMPUTE_USER_DATA_0 + 5, hi32(b_va))
-    self.dispatch_direct()
-    # CS_PARTIAL_FLUSH so stores retire before host poll (gfx_v8_0 EDC path).
+    self.set_sh_reg(REG_COMPUTE_USER_DATA_0 + 0, lo32(fb_va))
+    self.set_sh_reg(REG_COMPUTE_USER_DATA_0 + 1, hi32(fb_va))
+    self.dispatch_direct(width, height, 1)
     self.pkt3(PKT3_EVENT_WRITE, EVENT_TYPE_CS_PARTIAL_FLUSH | (EVENT_INDEX_CS_PARTIAL_FLUSH << 8))
     return self.words
 
@@ -5486,24 +5406,20 @@ class PolarisDevice:
       print(f"stage=kcq-ring-test ring_ok={ok} SCRATCH={scratch:#x} "
             f"PQ_WPTR={wptr:#x} PQ_RPTR={rptr:#x} no_doorbell={boot_no_doorbell()}")
       return
-    if stage == "add":
+    if stage == "trig":
       os.environ["AMD_BOOT_KCQ_DIRECT"] = "1"
-      # Session #22: skip_fw on a hot MEC (prior add.py left ME1 running) reuses a
-      # stale KCQ → RPTR stuck / result=0. Always cold-boot SMC LoadUcodes for add.
-      # If ME1 is already up, soft-reset first so LoadUcodes is clean.
+      # Same cold-boot rule as add/mul: hot MEC + skip_fw reuses stale KCQ.
       if b.compute_fw_loaded():
-        print("polaris: hot MEC detected — soft-reset before cold add boot", flush=True)
+        print("polaris: hot MEC detected — soft-reset before cold trig boot", flush=True)
         self.software_reset(mmio_reset=True)
         self._boot = PolarisBoot(self)
         b = self._boot
       self._boot_stage_kiq(b, map_queues=False, skip_fw=False)
-      cases = getattr(self, "_op_cases", None) or [((1.0, 2.0, 3.0, 4.0), (10.0, 20.0, 30.0, 40.0))]
-      for a, b_vals in cases:
-        result = self.run_add(a, b_vals)
-        expected = [OP(x, y) for x, y in zip(a, b_vals)]
-        print(f"stage=add a={list(a)} b={list(b_vals)} result={result}")
-        if not all(abs(r - e) < 1e-4 for r, e in zip(result, expected)):
-          raise RuntimeError(f"vector-{OP_NAME} failed: expected {expected}, got {result}")
+      out_path = getattr(self, "_trig_out", "triangle.ppm")
+      n_red, path = self.run_trig(out_path)
+      print(f"stage=trig wrote {path} ({WIDTH}x{HEIGHT}) red_pixels={n_red}")
+      if n_red < 1000:
+        raise RuntimeError(f"triangle raster failed: only {n_red} red pixels")
       return
     if stage == "kiq-nop":
       os.environ["AMD_BOOT_KIQ_NOP_TEST"] = "1"
@@ -5519,11 +5435,11 @@ class PolarisDevice:
     cq = self._boot._compute
     cq.submit_ib(ib_words)
 
-  def run_add(self, a=(1.0, 2.0, 3.0, 4.0), b_vals=(10.0, 20.0, 30.0, 40.0)):
+  def run_trig(self, out_path: str = "triangle.ppm"):
+    """Raster red triangle to RGBA8 fb (examples/radv_triangle.c verts), write PPM."""
     if self._boot is None:
       self.boot()
     boot = self._boot
-    # Prefer same aperture as KCQ ring (AGP when VRAM dead / COMPUTE_AGP=1).
     cq = boot._compute
     use_agp = cq is not None and getattr(cq, "_mem", None) == "agp"
     use_gtt = (not use_agp) and (not boot.probe_bar0_writes())
@@ -5544,41 +5460,37 @@ class PolarisDevice:
       self.upload(off, data)
       return self.vram_gpu_addr(off), None
 
-    expected = [OP(x, y) for x, y in zip(a, b_vals)]
-    a_bytes = struct.pack("4f", *a)
-    b_bytes = struct.pack("4f", *b_vals)
-    out_bytes = bytes(16)
-    a_va, _ = put_buf(a_bytes)
-    b_va, _ = put_buf(b_bytes)
-    out_va, out_mem = put_buf(out_bytes)
-    # PGM addr must be 256-byte aligned (COMPUTE_PGM_LO units).
-    shader_va, _ = put_buf(ADD_SHADER, round_up(max(len(ADD_SHADER), 0x100), 0x100))
-    ib = PM4Builder().build_dispatch_ib(shader_va, out_va, a_va, b_va)
+    fb_bytes = bytes(FB_BYTES)
+    fb_va, fb_mem = put_buf(fb_bytes, round_up(FB_BYTES, 0x1000))
+    fb_off = None if fb_mem is not None else (fb_va - (self._vram_start or 0))
+    shader_va, _ = put_buf(TRIG_SHADER, round_up(max(len(TRIG_SHADER), 0x100), 0x100))
+    ib = PM4Builder().build_dispatch_ib(shader_va, fb_va)
     if DEBUG >= 1:
-      print(f"polaris: ib_words={len(ib)} shader={len(ADD_SHADER)} "
+      print(f"polaris: ib_words={len(ib)} shader={len(TRIG_SHADER)} "
             f"mem={'agp' if use_agp else 'gtt' if use_gtt else 'vram'} "
-            f"shader={shader_va:#x} out={out_va:#x} expected={expected}", flush=True)
+            f"shader={shader_va:#x} fb={fb_va:#x}", flush=True)
     if cq is None:
       boot.init_compute_queue()
       cq = boot._compute
     drained = cq.submit_ib(ib)
-    # Wait for shader store to land in host memory (no IO coherency on M1).
-    deadline = time.time() + float(os.environ.get("AMD_BOOT_ADD_WAIT_S", "2"))
-    result = [0.0, 0.0, 0.0, 0.0]
+    deadline = time.time() + float(os.environ.get("AMD_BOOT_TRIG_WAIT_S", "5"))
+    rgba = bytes(FB_BYTES)
+    cx = ((160 * WIDTH) + 128) * 4
     while time.time() < deadline:
-      if out_mem is not None:
-        sysmem_dma_flush(out_mem, 16)
-        result = list(struct.unpack("4f", bytes(out_mem[0:16])))
+      if fb_mem is not None:
+        sysmem_dma_flush(fb_mem, FB_BYTES)
+        rgba = bytes(fb_mem[0:FB_BYTES])
       else:
-        out_off = out_va - (self._vram_start or 0)
-        result = list(struct.unpack("4f", bytes(self.vram[out_off:out_off + 16])))
-      # float compare: exact for these smoke values; allow tiny noise
-      if all(abs(r - e) < 1e-5 for r, e in zip(result, expected)):
-        result = list(expected)
+        rgba = bytes(self.vram[fb_off:fb_off + FB_BYTES])
+      if rgba[cx] == 0xFF and rgba[cx + 1] == 0 and rgba[cx + 2] == 0:
         break
-      time.sleep(0.01)
-    print(f"result={result} drained={drained}")
-    return result
+      time.sleep(0.02)
+    n_red = sum(1 for i in range(0, FB_BYTES, 4)
+                if rgba[i] == 0xFF and rgba[i + 1] == 0 and rgba[i + 2] == 0)
+    write_ppm(out_path, rgba, WIDTH, HEIGHT)
+    print(f"result=ppm red_pixels={n_red} drained={drained} out={out_path}")
+    return n_red, out_path
+
 
 def probe():
   dev = PolarisDevice()
@@ -5607,23 +5519,43 @@ def probe():
     mem, paddrs, _ = boot.alloc_sysmem_buffer(0x1000, contiguous=True)
     if paddrs:
       print(f"sysmem paddr[0]={paddrs[0]:#x} agp_mc={boot.agp_mc_addr(paddrs[0]):#x}")
-  print(f"shader_bytes={len(ADD_SHADER)} selftest=ok")
+  print(f"shader_bytes={len(TRIG_SHADER)} selftest=ok")
+
+def write_ppm(path: str, rgba: bytes, width: int = WIDTH, height: int = HEIGHT):
+  """RGBA8 → P6 PPM (same as examples/radv_triangle.c write_ppm)."""
+  rgb = bytearray(width * height * 3)
+  for i in range(width * height):
+    rgb[i * 3:i * 3 + 3] = rgba[i * 4:i * 4 + 3]
+  with open(path, "wb") as f:
+    f.write(f"P6\n{width} {height}\n255\n".encode())
+    f.write(rgb)
+
+def host_raster_ref() -> bytes:
+  """CPU reference: CW edge test, red fill — matches TRIG_SHADER."""
+  A, B, C = (128, 32), (224, 224), (32, 224)
+  def edge(ax, ay, bx, by, px, py):
+    return (px - ax) * (by - ay) - (py - ay) * (bx - ax)
+  fb = bytearray(FB_BYTES)
+  for y in range(HEIGHT):
+    for x in range(WIDTH):
+      if edge(*A, *B, x, y) <= 0 and edge(*B, *C, x, y) <= 0 and edge(*C, *A, x, y) <= 0:
+        i = (y * WIDTH + x) * 4
+        fb[i:i + 4] = b"\xff\x00\x00\xff"
+  return bytes(fb)
+
 
 def selftest():
-  ib = PM4Builder().build_dispatch_ib(0x10000, 0x20000, 0x30000, 0x40000)
-  assert len(ADD_SHADER) == 200
-  assert ADD_SHADER == build_shader(ALU_OP)
-  assert build_shader(Gcn3.Op.V_MUL_F32) != ADD_SHADER
-  assert len(ib) >= 20
+  ib = PM4Builder().build_dispatch_ib(0x10000, 0x20000)
+  assert len(TRIG_SHADER) == 240
+  assert len(ib) >= 16
   assert ib[0] >> 30 == PKT_TYPE3
-  set_pkt = [pkt3(PACKET3_SET_RESOURCES, 6), 0, 1, 0, 0, 0, 0, 0]
-  me_bit = (_map_queues_dbell(DOORBELL_MEC_RING0) | _map_queues_queue(0)
-            | _map_queues_pipe(0) | _map_queues_me(0))
-  map_pkt = [pkt3(PACKET3_MAP_QUEUES, 5), _map_queues_num_q(1), me_bit,
-             0xff00110000, 0xff, 0xff00120040, 0xff]
-  assert len(set_pkt) == 8 and len(map_pkt) == 7
-  sha = hashlib.sha256(ADD_SHADER).hexdigest()[:12]
-  print(f"middle_selftest=ok shader_sha={sha} ib_words={len(ib)} kiq_pkt_words={len(set_pkt)+len(map_pkt)}")
+  ref = host_raster_ref()
+  n_red = sum(1 for i in range(0, FB_BYTES, 4) if ref[i] == 0xFF)
+  assert n_red == 18625
+  cx = ((160 * WIDTH) + 128) * 4
+  assert ref[cx:cx + 4] == b"\xff\x00\x00\xff"
+  sha = hashlib.sha256(TRIG_SHADER).hexdigest()[:12]
+  print(f"middle_selftest=ok shader_sha={sha} ib_words={len(ib)} ref_red={n_red}")
 
 def reset_gpu(mode: str = "auto"):
   if mode != "auto":
@@ -5645,7 +5577,7 @@ def atom_info_cmd():
         f"scratch7={boot.rreg(0x5d0):#x} MISC0={boot.rreg(0xa80):#x}")
 
 def apply_add_defaults():
-  """Session #21 proven env for RX570 TinyGPU AGP vector-add (VRAM dead).
+  """Session #21 proven env for RX570 TinyGPU AGP compute (VRAM dead).
 
   setdefault: caller/env overrides still win."""
   defaults = {
@@ -5666,49 +5598,6 @@ def apply_add_defaults():
     os.environ.setdefault(k, v)
 
 
-def parse_vec4(s: str) -> tuple[float, float, float, float]:
-  parts = [float(x) for x in s.replace(" ", "").split(",") if x]
-  if len(parts) != 4:
-    raise SystemExit(f"need 4 floats, got {parts!r} from {s!r}")
-  return (parts[0], parts[1], parts[2], parts[3])
-
-
-def parse_op_cases(argv: list[str]) -> list[tuple[tuple[float, ...], tuple[float, ...]]]:
-  """CLI: default one case; --a/--b one case; --test several; --cases a:b;a:b"""
-  if "--test" in argv:
-    return [
-      ((1.0, 2.0, 3.0, 4.0), (10.0, 20.0, 30.0, 40.0)),
-      ((0.0, 0.0, 0.0, 0.0), (5.0, 5.0, 5.0, 5.0)),
-      ((-1.0, 2.0, -3.0, 4.0), (2.0, -2.0, 2.0, -2.0)),
-      ((0.5, 1.5, 2.5, 3.5), (2.0, 2.0, 2.0, 2.0)),
-      ((1e3, -1e3, 0.125, -0.5), (2.0, 0.5, 8.0, -4.0)),
-    ]
-  a = (1.0, 2.0, 3.0, 4.0)
-  b = (10.0, 20.0, 30.0, 40.0)
-  for i, arg in enumerate(argv):
-    if arg == "--a" and i + 1 < len(argv):
-      a = parse_vec4(argv[i + 1])
-    elif arg.startswith("--a="):
-      a = parse_vec4(arg.split("=", 1)[1])
-    elif arg == "--b" and i + 1 < len(argv):
-      b = parse_vec4(argv[i + 1])
-    elif arg.startswith("--b="):
-      b = parse_vec4(arg.split("=", 1)[1])
-    elif arg == "--cases" and i + 1 < len(argv):
-      out = []
-      for pair in argv[i + 1].split(";"):
-        left, right = pair.split(":")
-        out.append((parse_vec4(left), parse_vec4(right)))
-      return out
-    elif arg.startswith("--cases="):
-      out = []
-      for pair in arg.split("=", 1)[1].split(";"):
-        left, right = pair.split(":")
-        out.append((parse_vec4(left), parse_vec4(right)))
-      return out
-  return [(a, b)]
-
-
 def main():
   if "--probe" in sys.argv:
     probe(); return
@@ -5727,27 +5616,30 @@ def main():
     if arg.startswith("--boot-stage="):
       stage = arg.split("=", 1)[1]
   if stage is None and os.environ.get("AMD_BOOT_SAFE", "0") == "1":
-    print("AMD_BOOT_SAFE=1: not running vector-add.", file=sys.stderr)
-    print("  Run:   python3 add.py", file=sys.stderr)
-    print("  Or:    python3 add.py --boot-stage=add", file=sys.stderr)
-    print("  Probe: python3 add.py --probe | --selftest | --boot-stage=atom", file=sys.stderr)
+    print("AMD_BOOT_SAFE=1: not running triangle raster.", file=sys.stderr)
+    print("  Run:   python3 trig.py", file=sys.stderr)
+    print("  Or:    python3 trig.py --boot-stage=trig", file=sys.stderr)
+    print("  Probe: python3 trig.py --probe | --selftest | --boot-stage=atom", file=sys.stderr)
     sys.exit(2)
-  if stage in (None, "add", "kcq-ring-test"):
+  if stage in (None, "trig", "kcq-ring-test"):
     apply_add_defaults()
   if stage is None:
-    stage = "add"
+    stage = "trig"
   if stage:
-    if stage == "add":
+    if stage == "trig":
       os.environ["AMD_BOOT_ADD"] = "1"
     if stage == "kcq-ring-test":
       os.environ["AMD_BOOT_RING_TEST"] = "1"
-    cases = parse_op_cases(sys.argv[1:])
-    if stage == "add":
-      print(f"shader_bytes={len(ADD_SHADER)} op={OP_NAME} cases={len(cases)}", flush=True)
+    out_path = "triangle.ppm"
+    for arg in sys.argv[1:]:
+      if arg.startswith("--out="):
+        out_path = arg.split("=", 1)[1]
+    if stage == "trig":
+      print(f"shader_bytes={len(TRIG_SHADER)} op={OP_NAME} out={out_path}", flush=True)
     try:
       dev = PolarisDevice()
-      if stage == "add":
-        dev._op_cases = cases
+      if stage == "trig":
+        dev._trig_out = out_path
       dev.boot(stage=stage)
     except RuntimeError as e:
       print(str(e), file=sys.stderr)
