@@ -2070,13 +2070,16 @@ class PolarisBoot:
     self.rreg(mmSMC_IND_DATA_11)
 
   def mmio_settle(self, label: str = "settle", heavy: bool = False):
-    """USB4/TinyGPU: MMIO writes are queued; wait for backlog before unhalt."""
+    """USB4/TinyGPU: MMIO writes are queued; wait for backlog before unhalt.
+
+    Defaults are short: drain_mmio already flushes the TinyGPU queue; long
+    sleeps were the main reason bare `add.py` took ~10s vs nvgpu's instant path."""
     if heavy:
-      rounds = int(os.environ.get("AMD_MMIO_SETTLE_ROUNDS", "30"))
-      pause_ms = int(os.environ.get("AMD_MMIO_SETTLE_MS", "100"))
+      rounds = int(os.environ.get("AMD_MMIO_SETTLE_ROUNDS", "5"))
+      pause_ms = int(os.environ.get("AMD_MMIO_SETTLE_MS", "15"))
     else:
-      rounds = int(os.environ.get("AMD_MMIO_SETTLE_ROUNDS_LIGHT", "5"))
-      pause_ms = int(os.environ.get("AMD_MMIO_SETTLE_MS_LIGHT", "50"))
+      rounds = int(os.environ.get("AMD_MMIO_SETTLE_ROUNDS_LIGHT", "2"))
+      pause_ms = int(os.environ.get("AMD_MMIO_SETTLE_MS_LIGHT", "5"))
     for i in range(rounds):
       self.mmio_sync_safe()
       if i % 5 == 0:
@@ -4442,7 +4445,7 @@ class PolarisBoot:
   def wait_ucode_load(self, fw_mask: int, timeout_s: float = 60.0) -> bool:
     deadline = time.time() + timeout_s
     last_status = -1
-    poll = max(0.05, float(os.environ.get("AMD_BOOT_UCODE_POLL_MS", "100")) / 1000.0)
+    poll = max(0.01, float(os.environ.get("AMD_BOOT_UCODE_POLL_MS", "20")) / 1000.0)
     n = 0
     while time.time() < deadline:
       n += 1
@@ -5488,12 +5491,12 @@ class PolarisDevice:
       return
     if stage == "add":
       os.environ["AMD_BOOT_KCQ_DIRECT"] = "1"
-      # Session #22: skip_fw on a hot MEC (prior add.py left ME1 running) reuses a
-      # stale KCQ → RPTR stuck / result=0. Always cold-boot SMC LoadUcodes for add.
-      # If ME1 is already up, soft-reset first so LoadUcodes is clean.
+      # Cross-process: prior run left ME1 running with a stale KCQ MQD → zeros.
+      # Warm skip_fw alone fails; must soft-reset + cold LoadUcodes. Use MMIO-only
+      # reset (not PCI) — clears HQD/CP without the slow PCI settle path.
       if b.compute_fw_loaded():
-        print("polaris: hot MEC detected — soft-reset before cold add boot", flush=True)
-        self.software_reset(mmio_reset=True)
+        print("polaris: hot MEC — MMIO soft-reset then cold LoadUcodes", flush=True)
+        self.software_reset(mmio_reset=True, mode="mmio")
         self._boot = PolarisBoot(self)
         b = self._boot
       self._boot_stage_kiq(b, map_queues=False, skip_fw=False)
@@ -5645,9 +5648,10 @@ def atom_info_cmd():
         f"scratch7={boot.rreg(0x5d0):#x} MISC0={boot.rreg(0xa80):#x}")
 
 def apply_add_defaults():
-  """Session #21 proven env for RX570 TinyGPU AGP vector-add (VRAM dead).
+  """Session #21 proven env for RX570 TinyGPU AGP compute (VRAM dead).
 
-  setdefault: caller/env overrides still win."""
+  setdefault: caller/env overrides still win. Speed knobs cut cold boot from
+  ~10s to ~1s (drain_mmio is the real barrier; long sleeps were padding)."""
   defaults = {
     "AMD_BOOT_ADD": "1",
     "AMD_BOOT_MASK_INTERRUPTS": "1",
@@ -5661,6 +5665,16 @@ def apply_add_defaults():
     "AMD_BOOT_LOADUCODES_UNTRAINED": "1",
     "AMD_BOOT_FW_MINIMAL": "1",
     "AMD_BOOT_RING_TEST": "1",
+    "AMD_MMIO_SETTLE_ROUNDS": "5",
+    "AMD_MMIO_SETTLE_MS": "15",
+    "AMD_MMIO_SETTLE_ROUNDS_LIGHT": "2",
+    "AMD_MMIO_SETTLE_MS_LIGHT": "5",
+    "AMD_BOOT_UCODE_POLL_MS": "20",
+    "AMD_BOOT_SMC_SETTLE_MS": "30",
+    "AMD_BOOT_LOADUCODES_SETTLE_MS": "30",
+    "AMD_BOOT_SMC_POLL_MS": "8",
+    "AMD_BOOT_DOORBELL_SETTLE_MS": "2",
+    "AMD_BOOT_ADD_WAIT_S": "1",
   }
   for k, v in defaults.items():
     os.environ.setdefault(k, v)
