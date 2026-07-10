@@ -1,14 +1,20 @@
 #!/usr/bin/env python3
-"""Standalone AMD RX570 (Polaris10 / gfx803) eGPU vector-mul over TinyGPU.app on macOS.
+"""Standalone AMD RX570 (Polaris10 / gfx803) eGPU neural ops over TinyGPU.app on macOS.
 
 Vendored single-file (nvgpu examples/add.py style): TinyGPU transport + ATOM BIOS
-interpreter + Polaris boot/ComputeQueue + PM4 vector-mul.
+interpreter + Polaris boot/ComputeQueue + PM4 neural kernels.
+
+gfx803 GCN3 flat shaders (llvm-mc -mcpu=gfx803 reference), not TrustOS RDNA blobs:
+  relu  — out[i] = max(a[i], 0)
+  scale — out[i] = a[i] * alpha   (alpha in USER_DATA s4)
+  gemm  — C = A @ B for 2x2 FP32 row-major (v_mul_f32 + v_mad_f32)
 
 Usage:
-  python3 examples_egpu/mul.py
-  python3 examples_egpu/mul.py --test
-  python3 examples_egpu/mul.py --selftest
-  python3 examples_egpu/mul.py --boot-stage=add
+  python3 examples_egpu/neural.py --op=relu
+  python3 examples_egpu/neural.py --op=scale --alpha=2.5
+  python3 examples_egpu/neural.py --op=gemm --test
+  python3 examples_egpu/neural.py --selftest
+  python3 examples_egpu/neural.py --op=relu --boot-stage=add
 """
 from __future__ import annotations
 import os, sys, ctypes, ctypes.util, time, mmap, struct, array, socket, subprocess
@@ -411,9 +417,10 @@ PKT3_PFP_SYNC_ME = 0x23
 DISPATCH_INITIATOR_COMPUTE_SHADER_EN = 1 << 0
 DISPATCH_INITIATOR_FORCE_START_AT_000 = 1 << 2
 
-# gfx803 ISA (GCN3) — named encoders like nvgpu CubinHelper / build_cubin.
-# User SGPRs: s[0:1]=out, s[2:3]=a, s[4:5]=b. VGPRs v0..v13 → RSRC1 VGPRS>=3.
-# VOP2: OP[30:25] | VSRC1[24:17] | SRC0[16:9] | VDST[8:0]
+# gfx803 ISA (GCN3) — encoders match llvm-mc -arch=amdgcn -mcpu=gfx803.
+# User SGPRs: s[0:1]=out/C, s[2:3]=a/A, s[4:5]=b/B or s[4]=alpha.
+# VOP2 (llvm): OP[30:25] | VDST[24:17] | VSRC1[16:9] | SRC0[8:0]
+#   SRC0: VGPR=0x100|n, SGPR=n, imm=0x80|imm
 class Gcn3:
   class Reg:
     V0, V1, V2, V3, V4, V5, V6, V7 = range(8)
@@ -423,6 +430,7 @@ class Gcn3:
   class Op:
     V_ADD_F32 = 1
     V_MUL_F32 = 5
+    V_MAX_F32 = 0x0B
     V_ADD_U32 = 0x19
     S_WAITCNT_VM0_LGKM0 = 0xBF8C0070
     S_ENDPGM = 0xBF810000
@@ -454,48 +462,125 @@ class Gcn3:
 
   @staticmethod
   def v_add_u32(vd: int, imm: int, vs1: int) -> int:
-    """v_add_u32 vd, vcc, imm, vs1 (inline imm lands in VDST field; matches llvm-mc)."""
+    """v_add_u32 vd, vcc, imm, vs1 (inline imm; matches llvm-mc)."""
     return ((Gcn3.Op.V_ADD_U32 & 0x3F) << 25) | ((vs1 & 0xFF) << 17) | ((vd & 0x1FF) << 9) | (0x80 | (imm & 0x7F))
 
   @staticmethod
-  def v_binop_f32(op6: int, vd: int, src0: int, vsrc1: int) -> int:
-    """v_{add,mul}_f32_e32 vd, src0, vsrc1 (VDST bit8 set; HW-proven blob encoding)."""
-    return ((op6 & 0x3F) << 25) | ((vsrc1 & 0xFF) << 17) | ((src0 & 0x1FF) << 9) | (0x100 | (vd & 0xFF))
+  def src0_vgpr(v: int) -> int:
+    return 0x100 | (v & 0xFF)
 
-def build_shader(alu_op: int) -> bytes:
-  """4-wide float kernel: out[i] = a[i] OP b[i] via flat load/store (gfx803)."""
+  @staticmethod
+  def src0_imm(imm: int) -> int:
+    return 0x80 | (imm & 0x7F)
+
+  @staticmethod
+  def v_f32_e32(op6: int, vd: int, src0: int, vsrc1: int) -> int:
+    """v_{mul,max,...}_f32 vd, src0, vsrc1 — llvm-mc gfx803 VOP2 layout."""
+    return ((op6 & 0x3F) << 25) | ((vd & 0xFF) << 17) | ((vsrc1 & 0xFF) << 9) | (src0 & 0x1FF)
+
+  @classmethod
+  def v_mul_f32(cls, vd: int, src0: int, vsrc1: int) -> int:
+    return cls.v_f32_e32(cls.Op.V_MUL_F32, vd, src0, vsrc1)
+
+  @classmethod
+  def v_max_f32(cls, vd: int, src0: int, vsrc1: int) -> int:
+    return cls.v_f32_e32(cls.Op.V_MAX_F32, vd, src0, vsrc1)
+
+  @staticmethod
+  def v_mad_f32(vd: int, s0: int, s1: int, s2: int) -> tuple[int, int]:
+    """VOP3a v_mad_f32 vd, s0, s1, s2 (llvm: d1c1xxxx / src encoding)."""
+    return (
+      0xD1C10000 | (vd & 0xFF),
+      (0x100 | (s0 & 0xFF)) | ((0x100 | (s1 & 0xFF)) << 9) | ((0x100 | (s2 & 0xFF)) << 18),
+    )
+
+def _load4(w: list[int], base_s: int, vds: tuple[int, ...]):
+  R = Gcn3.Reg
+  w += [Gcn3.v_mov_b32_sgpr(R.V12, base_s), Gcn3.v_mov_b32_sgpr(R.V13, base_s + 1)]
+  for i, vd in enumerate(vds):
+    w += list(Gcn3.flat_load_dword(vd, R.V12))
+    if i != len(vds) - 1:
+      w.append(Gcn3.v_add_u32(R.V12, 4, R.V12))
+
+def _store4(w: list[int], vds: tuple[int, ...]):
   R, Op = Gcn3.Reg, Gcn3.Op
-  w: list[int] = []
-  # COMMON_PREFIX: byte offsets + load a[0..3]
-  w += [Gcn3.v_mov_b32_imm(i, 4 * i) for i in (R.V0, R.V1, R.V2, R.V3)]
-  w += [Gcn3.v_mov_b32_sgpr(R.V12, R.S2), Gcn3.v_mov_b32_sgpr(R.V13, R.S3)]
-  for vd in (R.V4, R.V5, R.V6, R.V7):
-    w += list(Gcn3.flat_load_dword(vd, R.V12))
-    if vd != R.V7:
-      w.append(Gcn3.v_add_u32(R.V12, 4, R.V12))
-  # load b[0..3]
-  w += [Gcn3.v_mov_b32_sgpr(R.V12, R.S4), Gcn3.v_mov_b32_sgpr(R.V13, R.S5)]
-  for vd in (R.V8, R.V9, R.V10, R.V11):
-    w += list(Gcn3.flat_load_dword(vd, R.V12))
-    if vd != R.V11:
-      w.append(Gcn3.v_add_u32(R.V12, 4, R.V12))
-  w.append(Op.S_WAITCNT_VM0_LGKM0)
-  # ARITHMETIC: v_op_f32 v{4+i}, v{8+i}, v{4+i}
-  for i in range(4):
-    w.append(Gcn3.v_binop_f32(alu_op, R.V4 + i, R.V8 + i, R.V4 + i))
-  # COMMON_SUFFIX: store out[0..3]
   w += [Gcn3.v_mov_b32_sgpr(R.V12, R.S0), Gcn3.v_mov_b32_sgpr(R.V13, R.S1)]
-  for vd in (R.V4, R.V5, R.V6, R.V7):
+  for i, vd in enumerate(vds):
     w += list(Gcn3.flat_store_dword(R.V12, vd))
-    if vd != R.V7:
+    if i != len(vds) - 1:
       w.append(Gcn3.v_add_u32(R.V12, 4, R.V12))
   w += [Op.S_WAITCNT_VM0_LGKM0, Op.S_ENDPGM]
+
+def build_shader_relu() -> bytes:
+  """4-wide: out[i] = max(a[i], 0). s[0:1]=out, s[2:3]=a."""
+  R, Op = Gcn3.Reg, Gcn3.Op
+  w: list[int] = []
+  w += [Gcn3.v_mov_b32_imm(i, 4 * i) for i in (R.V0, R.V1, R.V2, R.V3)]
+  _load4(w, R.S2, (R.V4, R.V5, R.V6, R.V7))
+  w.append(Op.S_WAITCNT_VM0_LGKM0)
+  for vd in (R.V4, R.V5, R.V6, R.V7):
+    w.append(Gcn3.v_max_f32(vd, Gcn3.src0_imm(0), vd))
+  _store4(w, (R.V4, R.V5, R.V6, R.V7))
   return Gcn3.words_blob(w)
 
-ALU_OP = Gcn3.Op.V_MUL_F32
-OP = lambda x, y: x * y
-OP_NAME = "mul"
-ADD_SHADER = build_shader(ALU_OP)
+def build_shader_scale() -> bytes:
+  """4-wide: out[i] = a[i] * alpha. s[0:1]=out, s[2:3]=a, s[4]=alpha."""
+  R, Op = Gcn3.Reg, Gcn3.Op
+  w: list[int] = []
+  w += [Gcn3.v_mov_b32_imm(i, 4 * i) for i in (R.V0, R.V1, R.V2, R.V3)]
+  _load4(w, R.S2, (R.V4, R.V5, R.V6, R.V7))
+  w.append(Op.S_WAITCNT_VM0_LGKM0)
+  for vd in (R.V4, R.V5, R.V6, R.V7):
+    w.append(Gcn3.v_mul_f32(vd, R.S4, vd))
+  _store4(w, (R.V4, R.V5, R.V6, R.V7))
+  return Gcn3.words_blob(w)
+
+def build_shader_gemm2x2() -> bytes:
+  """2x2 FP32 GEMM: C = A @ B (row-major). s[0:1]=C, s[2:3]=A, s[4:5]=B."""
+  R, Op = Gcn3.Reg, Gcn3.Op
+  w: list[int] = []
+  _load4(w, R.S2, (R.V0, R.V1, R.V2, R.V3))  # A00 A01 A10 A11
+  _load4(w, R.S4, (R.V4, R.V5, R.V6, R.V7))  # B00 B01 B10 B11
+  w.append(Op.S_WAITCNT_VM0_LGKM0)
+  # C00=A00*B00+A01*B10; C01=A00*B01+A01*B11; C10=A10*B00+A11*B10; C11=A10*B01+A11*B11
+  for vd, a0, b0, a1, b1 in (
+    (R.V8, R.V0, R.V4, R.V1, R.V6),
+    (R.V9, R.V0, R.V5, R.V1, R.V7),
+    (R.V10, R.V2, R.V4, R.V3, R.V6),
+    (R.V11, R.V2, R.V5, R.V3, R.V7),
+  ):
+    w.append(Gcn3.v_mul_f32(vd, Gcn3.src0_vgpr(a0), b0))
+    w += list(Gcn3.v_mad_f32(vd, a1, b1, vd))
+  _store4(w, (R.V8, R.V9, R.V10, R.V11))
+  return Gcn3.words_blob(w)
+
+def select_op(name: str, alpha: float = 2.0):
+  """Set module globals for the chosen neural op."""
+  global OP_NAME, KIND, ADD_SHADER, ALPHA, OP
+  name = name.lower()
+  ALPHA = float(alpha)
+  if name == "relu":
+    OP_NAME, KIND = "relu", "relu"
+    ADD_SHADER = build_shader_relu()
+    OP = lambda x, _y=0: max(float(x), 0.0)
+  elif name == "scale":
+    OP_NAME, KIND = "scale", "scale"
+    ADD_SHADER = build_shader_scale()
+    OP = lambda x, _y=0, a=ALPHA: float(x) * a
+  elif name == "gemm":
+    OP_NAME, KIND = "gemm", "gemm"
+    ADD_SHADER = build_shader_gemm2x2()
+    OP = None  # matrix; see expected_for
+  else:
+    raise SystemExit(f"unknown --op={name!r}; use relu|scale|gemm")
+  return OP_NAME
+
+# Defaults (overridden by --op before boot).
+ALPHA = 2.0
+OP_NAME = "relu"
+KIND = "relu"
+ADD_SHADER = build_shader_relu()
+OP = lambda x, _y=0: max(float(x), 0.0)
 PKT3_EVENT_WRITE = 0x46
 EVENT_TYPE_CS_PARTIAL_FLUSH = 7
 EVENT_INDEX_CS_PARTIAL_FLUSH = 4
@@ -533,12 +618,13 @@ class PM4Builder:
     self.words[-5] |= PACKET3_SHADER_TYPE_S
 
   def build_dispatch_ib(self, shader_gpu_addr: int, out_va: int, a_va: int, b_va: int,
-                        rsrc1=0x000f0043, rsrc2=0x0000000c) -> list[int]:
-    """Build PM4 IB for 1x1x1 threadgroup, 4-wide float add.
+                        rsrc1=0x000f0043, rsrc2=0x0000000c, alpha_bits: int | None = None) -> list[int]:
+    """Build PM4 IB for 1x1x1 threadgroup neural dispatch.
 
     COMPUTE_PGM_LO/HI are in 256-byte units (gfx_v8_0_do_edc_gpr_workarounds).
     rsrc1: VGPRS=3 (16 VGPRs), SGPRS=1 (16 SGPRs), FLOAT_MODE=0xf0.
-    rsrc2: USER_SGPR=6 → bits[5:1]=6 → 0xc."""
+    rsrc2: USER_SGPR=6 → bits[5:1]=6 → 0xc.
+    scale: USER_DATA_4 = alpha float bits (s4); USER_DATA_5 unused."""
     self.words = []
     self.set_sh_reg(REG_COMPUTE_START_X, 0)
     self.set_sh_reg(REG_COMPUTE_START_Y, 0)
@@ -554,8 +640,12 @@ class PM4Builder:
     self.set_sh_reg(REG_COMPUTE_USER_DATA_0 + 1, hi32(out_va))
     self.set_sh_reg(REG_COMPUTE_USER_DATA_0 + 2, lo32(a_va))
     self.set_sh_reg(REG_COMPUTE_USER_DATA_0 + 3, hi32(a_va))
-    self.set_sh_reg(REG_COMPUTE_USER_DATA_0 + 4, lo32(b_va))
-    self.set_sh_reg(REG_COMPUTE_USER_DATA_0 + 5, hi32(b_va))
+    if alpha_bits is not None:
+      self.set_sh_reg(REG_COMPUTE_USER_DATA_0 + 4, alpha_bits & 0xFFFFFFFF)
+      self.set_sh_reg(REG_COMPUTE_USER_DATA_0 + 5, 0)
+    else:
+      self.set_sh_reg(REG_COMPUTE_USER_DATA_0 + 4, lo32(b_va))
+      self.set_sh_reg(REG_COMPUTE_USER_DATA_0 + 5, hi32(b_va))
     self.dispatch_direct()
     # CS_PARTIAL_FLUSH so stores retire before host poll (gfx_v8_0 EDC path).
     self.pkt3(PKT3_EVENT_WRITE, EVENT_TYPE_CS_PARTIAL_FLUSH | (EVENT_INDEX_CS_PARTIAL_FLUSH << 8))
@@ -5524,10 +5614,10 @@ class PolarisDevice:
       cases = getattr(self, "_op_cases", None) or [((1.0, 2.0, 3.0, 4.0), (10.0, 20.0, 30.0, 40.0))]
       for a, b_vals in cases:
         result = self.run_add(a, b_vals)
-        expected = [OP(x, y) for x, y in zip(a, b_vals)]
+        expected = expected_for(a, b_vals)
         print(f"stage=add a={list(a)} b={list(b_vals)} result={result}")
-        if not all(abs(r - e) < 1e-4 for r, e in zip(result, expected)):
-          raise RuntimeError(f"vector-{OP_NAME} failed: expected {expected}, got {result}")
+        if not all(abs(float(r) - float(e)) < 1e-4 for r, e in zip(result, expected)):
+          raise RuntimeError(f"neural-{OP_NAME} failed: expected {expected}, got {result}")
       return
     if stage == "kiq-nop":
       os.environ["AMD_BOOT_KIQ_NOP_TEST"] = "1"
@@ -5547,7 +5637,6 @@ class PolarisDevice:
     if self._boot is None:
       self.boot()
     boot = self._boot
-    # Prefer same aperture as KCQ ring (AGP when VRAM dead / COMPUTE_AGP=1).
     cq = boot._compute
     use_agp = cq is not None and getattr(cq, "_mem", None) == "agp"
     use_gtt = (not use_agp) and (not boot.probe_bar0_writes())
@@ -5568,25 +5657,26 @@ class PolarisDevice:
       self.upload(off, data)
       return self.vram_gpu_addr(off), None
 
-    expected = [OP(x, y) for x, y in zip(a, b_vals)]
+    expected = expected_for(a, b_vals)
     a_bytes = struct.pack("4f", *a)
     b_bytes = struct.pack("4f", *b_vals)
     out_bytes = bytes(16)
     a_va, _ = put_buf(a_bytes)
     b_va, _ = put_buf(b_bytes)
     out_va, out_mem = put_buf(out_bytes)
-    # PGM addr must be 256-byte aligned (COMPUTE_PGM_LO units).
     shader_va, _ = put_buf(ADD_SHADER, round_up(max(len(ADD_SHADER), 0x100), 0x100))
-    ib = PM4Builder().build_dispatch_ib(shader_va, out_va, a_va, b_va)
+    alpha_bits = None
+    if KIND == "scale":
+      alpha_bits = struct.unpack("<I", struct.pack("<f", ALPHA))[0]
+    ib = PM4Builder().build_dispatch_ib(shader_va, out_va, a_va, b_va, alpha_bits=alpha_bits)
     if DEBUG >= 1:
-      print(f"polaris: ib_words={len(ib)} shader={len(ADD_SHADER)} "
+      print(f"polaris: ib_words={len(ib)} shader={len(ADD_SHADER)} op={OP_NAME} "
             f"mem={'agp' if use_agp else 'gtt' if use_gtt else 'vram'} "
             f"shader={shader_va:#x} out={out_va:#x} expected={expected}", flush=True)
     if cq is None:
       boot.init_compute_queue()
       cq = boot._compute
     drained = cq.submit_ib(ib)
-    # Wait for shader store to land in host memory (no IO coherency on M1).
     deadline = time.time() + float(os.environ.get("AMD_BOOT_ADD_WAIT_S", "2"))
     result = [0.0, 0.0, 0.0, 0.0]
     while time.time() < deadline:
@@ -5596,13 +5686,13 @@ class PolarisDevice:
       else:
         out_off = out_va - (self._vram_start or 0)
         result = list(struct.unpack("4f", bytes(self.vram[out_off:out_off + 16])))
-      # float compare: exact for these smoke values; allow tiny noise
       if all(abs(r - e) < 1e-5 for r, e in zip(result, expected)):
         result = list(expected)
         break
       time.sleep(0.01)
     print(f"result={result} drained={drained}")
     return result
+
 
 def probe():
   dev = PolarisDevice()
@@ -5634,20 +5724,30 @@ def probe():
   print(f"shader_bytes={len(ADD_SHADER)} selftest=ok")
 
 def selftest():
+  # llvm-mc -mcpu=gfx803 golden blobs (assembled offline; checked in when present).
+  for name, builder, path in (
+    ("relu", build_shader_relu, "/tmp/relu4.bin"),
+    ("scale", build_shader_scale, "/tmp/scale4.bin"),
+    ("gemm", build_shader_gemm2x2, "/tmp/gemm2x2.bin"),
+  ):
+    blob = builder()
+    assert len(blob) >= 40 and blob.endswith(struct.pack("<I", Gcn3.Op.S_ENDPGM))
+    if os.path.isfile(path):
+      golden = open(path, "rb").read()
+      assert blob == golden, f"{name} shader != llvm-mc ({len(blob)} vs {len(golden)})"
+  select_op("relu")
   ib = PM4Builder().build_dispatch_ib(0x10000, 0x20000, 0x30000, 0x40000)
-  assert len(ADD_SHADER) == 200
-  assert ADD_SHADER == build_shader(ALU_OP)
-  assert build_shader(Gcn3.Op.V_ADD_F32) != ADD_SHADER
-  assert len(ib) >= 20
-  assert ib[0] >> 30 == PKT_TYPE3
-  set_pkt = [pkt3(PACKET3_SET_RESOURCES, 6), 0, 1, 0, 0, 0, 0, 0]
-  me_bit = (_map_queues_dbell(DOORBELL_MEC_RING0) | _map_queues_queue(0)
-            | _map_queues_pipe(0) | _map_queues_me(0))
-  map_pkt = [pkt3(PACKET3_MAP_QUEUES, 5), _map_queues_num_q(1), me_bit,
-             0xff00110000, 0xff, 0xff00120040, 0xff]
-  assert len(set_pkt) == 8 and len(map_pkt) == 7
+  assert len(ib) >= 20 and ib[0] >> 30 == PKT_TYPE3
+  select_op("scale", 2.5)
+  ib_s = PM4Builder().build_dispatch_ib(0x10000, 0x20000, 0x30000, 0, alpha_bits=0x40200000)
+  assert any(w == 0x40200000 for w in ib_s)
+  select_op("gemm")
+  A = (1.0, 2.0, 3.0, 4.0); B = (5.0, 6.0, 7.0, 8.0)
+  assert expected_for(A, B) == [19.0, 22.0, 43.0, 50.0]
+  select_op("relu")
   sha = hashlib.sha256(ADD_SHADER).hexdigest()[:12]
-  print(f"middle_selftest=ok shader_sha={sha} ib_words={len(ib)} kiq_pkt_words={len(set_pkt)+len(map_pkt)}")
+  print(f"neural_selftest=ok relu_sha={sha} ib_words={len(ib)} "
+        f"sizes={{relu:{len(build_shader_relu())},scale:{len(build_shader_scale())},gemm:{len(build_shader_gemm2x2())}}}")
 
 def reset_gpu(mode: str = "auto"):
   if mode != "auto":
@@ -5701,25 +5801,76 @@ def apply_add_defaults():
     os.environ.setdefault(k, v)
 
 
+def gemm2x2(a, b):
+  """Row-major 2x2: C = A @ B."""
+  a00, a01, a10, a11 = a
+  b00, b01, b10, b11 = b
+  return [
+    a00 * b00 + a01 * b10,
+    a00 * b01 + a01 * b11,
+    a10 * b00 + a11 * b10,
+    a10 * b01 + a11 * b11,
+  ]
+
+def expected_for(a, b_vals):
+  kind = globals().get("KIND", "relu")
+  if kind == "relu":
+    return [max(float(x), 0.0) for x in a]
+  if kind == "scale":
+    return [float(x) * float(ALPHA) for x in a]
+  if kind == "gemm":
+    return gemm2x2(a, b_vals)
+  return [OP(x, y) for x, y in zip(a, b_vals)]
+
 def parse_vec4(s: str) -> tuple[float, float, float, float]:
   parts = [float(x) for x in s.replace(" ", "").split(",") if x]
   if len(parts) != 4:
     raise SystemExit(f"need 4 floats, got {parts!r} from {s!r}")
   return (parts[0], parts[1], parts[2], parts[3])
 
+def parse_op_arg(argv: list[str]) -> tuple[str, float]:
+  op, alpha = "relu", 2.0
+  for i, arg in enumerate(argv):
+    if arg.startswith("--op="):
+      op = arg.split("=", 1)[1]
+    elif arg == "--op" and i + 1 < len(argv):
+      op = argv[i + 1]
+    elif arg.startswith("--alpha="):
+      alpha = float(arg.split("=", 1)[1])
+    elif arg == "--alpha" and i + 1 < len(argv):
+      alpha = float(argv[i + 1])
+  return op, alpha
 
 def parse_op_cases(argv: list[str]) -> list[tuple[tuple[float, ...], tuple[float, ...]]]:
-  """CLI: default one case; --a/--b one case; --test several; --cases a:b;a:b"""
+  """CLI: default one case; --a/--b; --test several; --cases a:b;a:b"""
+  kind = globals().get("KIND", "relu")
   if "--test" in argv:
+    if kind == "relu":
+      return [
+        ((1.0, -2.0, 3.0, -4.0), (0.0, 0.0, 0.0, 0.0)),
+        ((-1.0, -2.0, -3.0, -4.0), (0.0, 0.0, 0.0, 0.0)),
+        ((0.0, 0.5, -0.5, 2.0), (0.0, 0.0, 0.0, 0.0)),
+        ((1e3, -1e3, 0.125, -0.5), (0.0, 0.0, 0.0, 0.0)),
+      ]
+    if kind == "scale":
+      return [
+        ((1.0, 2.0, 3.0, 4.0), (0.0, 0.0, 0.0, 0.0)),
+        ((-1.0, 0.5, 2.0, -4.0), (0.0, 0.0, 0.0, 0.0)),
+        ((0.0, 1.0, -1.0, 0.25), (0.0, 0.0, 0.0, 0.0)),
+      ]
+    # gemm
     return [
-      ((1.0, 2.0, 3.0, 4.0), (10.0, 20.0, 30.0, 40.0)),
-      ((0.0, 0.0, 0.0, 0.0), (5.0, 5.0, 5.0, 5.0)),
-      ((-1.0, 2.0, -3.0, 4.0), (2.0, -2.0, 2.0, -2.0)),
-      ((0.5, 1.5, 2.5, 3.5), (2.0, 2.0, 2.0, 2.0)),
-      ((1e3, -1e3, 0.125, -0.5), (2.0, 0.5, 8.0, -4.0)),
+      ((1.0, 2.0, 3.0, 4.0), (5.0, 6.0, 7.0, 8.0)),
+      ((1.0, 0.0, 0.0, 1.0), (2.0, 3.0, 4.0, 5.0)),
+      ((0.0, 0.0, 0.0, 0.0), (1.0, 2.0, 3.0, 4.0)),
+      ((2.0, 0.0, 0.0, 2.0), (0.5, 0.0, 0.0, 0.5)),
     ]
-  a = (1.0, 2.0, 3.0, 4.0)
-  b = (10.0, 20.0, 30.0, 40.0)
+  if kind == "gemm":
+    a, b = (1.0, 2.0, 3.0, 4.0), (5.0, 6.0, 7.0, 8.0)
+  elif kind == "scale":
+    a, b = (1.0, 2.0, 3.0, 4.0), (0.0, 0.0, 0.0, 0.0)
+  else:
+    a, b = (1.0, -2.0, 3.0, -4.0), (0.0, 0.0, 0.0, 0.0)
   for i, arg in enumerate(argv):
     if arg == "--a" and i + 1 < len(argv):
       a = parse_vec4(argv[i + 1])
@@ -5745,6 +5896,8 @@ def parse_op_cases(argv: list[str]) -> list[tuple[tuple[float, ...], tuple[float
 
 
 def main():
+  op, alpha = parse_op_arg(sys.argv[1:])
+  select_op(op, alpha)
   if "--probe" in sys.argv:
     probe(); return
   if "--atom-info" in sys.argv:
@@ -5778,7 +5931,7 @@ def main():
       os.environ["AMD_BOOT_RING_TEST"] = "1"
     cases = parse_op_cases(sys.argv[1:])
     if stage == "add":
-      print(f"shader_bytes={len(ADD_SHADER)} op={OP_NAME} cases={len(cases)}", flush=True)
+      print(f"shader_bytes={len(ADD_SHADER)} op={OP_NAME} alpha={ALPHA} cases={len(cases)}", flush=True)
     try:
       dev = PolarisDevice()
       if stage == "add":

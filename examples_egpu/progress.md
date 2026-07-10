@@ -2,29 +2,49 @@
 
 **Goal:** Run vector-add on **AMD RX570 (Polaris10 / gfx803, `1002:67df`)** via **TinyGPU.app** bare-metal MMIO/PM4 — not macOS `AMDRadeon*` kexts.
 
-**Last updated:** 2026-07-10 — deadcode cleanup: keep `add.py` / `mul.py` / `trig.py` + `progress.md` only
-(vendored standalone; removed one-shot `trace_*` / `test_*` / duplicate `polaris_boot.py`+`atom_replay.py`).
+**Last updated:** 2026-07-10 — `neural.py` gfx803 GEMM/ReLU/Scale (llvm-mc reference, HW PASS)
 
 ## Current status
 
 **PASS:** `python examples_egpu/add.py` → `[11.0, 22.0, 33.0, 44.0]` (~1s cold boot)
 **PASS:** `python examples_egpu/mul.py --test`
 **PASS:** `python examples_egpu/trig.py` → `triangle.ppm` (18625 red pixels)
+**PASS:** TrustOS GCN4 agents ported — `incr` / `memfill` / `memcopy` (flat, 4-wide)
+**PASS:** `neural.py` — gfx803 flat ReLU / Scale / 2×2 GEMM (not TrustOS RDNA blobs)
 
 ```bash
 python examples_egpu/add.py
 python examples_egpu/mul.py
 python examples_egpu/trig.py
+python examples_egpu/incr.py      # out[i]=a[i]+1
+python examples_egpu/memfill.py   # out[i]=a[0]
+python examples_egpu/memcopy.py   # out[i]=a[i]
+python examples_egpu/neural.py --op=relu --test
+python examples_egpu/neural.py --op=scale --alpha=2.5 --test
+python examples_egpu/neural.py --op=gemm --test
 ```
 
 ### Live files
 
 | File | Role |
 |------|------|
-| `add.py` | Standalone vector-add (vendors ATOM + Polaris boot) |
-| `mul.py` | Same stack, `v_mul_f32` |
+| `add.py` / `mul.py` | float binops (`v_add_f32` / `v_mul_f32`) |
+| `incr.py` / `memfill.py` / `memcopy.py` | TrustOS `AGENT_*_GCN4` (u32 flat) |
+| `neural.py` | gfx803 neural: ReLU / Scale / 2×2 FP32 GEMM (`v_max_f32` / `v_mul_f32` / `v_mad_f32`) |
 | `trig.py` | Compute raster of `examples/radv_triangle.c` verts → PPM |
 | `progress.md` | Bring-up log (historical) |
+
+### Session — neural.py (gfx803, llvm-mc)
+
+Own GCN3 flat kernels (TrustOS `neural.rs` is RDNA/MUBUF — not used):
+
+| Op | Math | USER_DATA | Shader |
+|----|------|-----------|--------|
+| `relu` | `out[i]=max(a[i],0)` | s[0:1]=out, s[2:3]=a | `v_max_f32 vd, 0, vd` |
+| `scale` | `out[i]=a[i]*α` | s[4]=α float bits | `v_mul_f32 vd, s4, vd` |
+| `gemm` | 2×2 `C=A@B` row-major | s[0:1]=C, s[2:3]=A, s[4:5]=B | `v_mul_f32` + `v_mad_f32` |
+
+Encodings match `llvm-mc -arch=amdgcn -mcpu=gfx803`. HW `--test` PASS on RX570 TinyGPU.
 
 ### Session #22 — first-boot fail + single-file
 

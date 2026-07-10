@@ -1,14 +1,13 @@
 #!/usr/bin/env python3
-"""Standalone AMD RX570 (Polaris10 / gfx803) eGPU vector-mul over TinyGPU.app on macOS.
+"""Standalone AMD RX570 (Polaris10 / gfx803) eGPU vector-incr (TrustOS AGENT_INCR_GCN4: out[i]=a[i]+1 u32) over TinyGPU.app on macOS.
 
 Vendored single-file (nvgpu examples/add.py style): TinyGPU transport + ATOM BIOS
-interpreter + Polaris boot/ComputeQueue + PM4 vector-mul.
+interpreter + Polaris boot/ComputeQueue + PM4 vector-incr (TrustOS AGENT_INCR_GCN4: out[i]=a[i]+1 u32).
 
 Usage:
-  python3 examples_egpu/mul.py
-  python3 examples_egpu/mul.py --test
-  python3 examples_egpu/mul.py --selftest
-  python3 examples_egpu/mul.py --boot-stage=add
+  python3 examples_egpu/incr.py
+  python3 examples_egpu/incr.py --test
+  python3 examples_egpu/incr.py --selftest
 """
 from __future__ import annotations
 import os, sys, ctypes, ctypes.util, time, mmap, struct, array, socket, subprocess
@@ -462,28 +461,30 @@ class Gcn3:
     """v_{add,mul}_f32_e32 vd, src0, vsrc1 (VDST bit8 set; HW-proven blob encoding)."""
     return ((op6 & 0x3F) << 25) | ((vsrc1 & 0xFF) << 17) | ((src0 & 0x1FF) << 9) | (0x100 | (vd & 0xFF))
 
-def build_shader(alu_op: int) -> bytes:
-  """4-wide float kernel: out[i] = a[i] OP b[i] via flat load/store (gfx803)."""
+
+  @staticmethod
+  def v_lshlrev_b32(vd: int, imm: int, vs1: int) -> int:
+    """v_lshlrev_b32 vd, imm, vs1 — VOP2 OP=0x12 (TrustOS AGENT_* / llvm)."""
+    return ((0x12 & 0x3F) << 25) | ((vs1 & 0xFF) << 17) | ((0x80 | (imm & 0x7F)) << 9) | (vd & 0xFF)
+
+def build_shader_binop_f32(alu_op: int) -> bytes:
+  """4-wide float: out[i] = a[i] OP b[i] (add/mul)."""
   R, Op = Gcn3.Reg, Gcn3.Op
   w: list[int] = []
-  # COMMON_PREFIX: byte offsets + load a[0..3]
   w += [Gcn3.v_mov_b32_imm(i, 4 * i) for i in (R.V0, R.V1, R.V2, R.V3)]
   w += [Gcn3.v_mov_b32_sgpr(R.V12, R.S2), Gcn3.v_mov_b32_sgpr(R.V13, R.S3)]
   for vd in (R.V4, R.V5, R.V6, R.V7):
     w += list(Gcn3.flat_load_dword(vd, R.V12))
     if vd != R.V7:
       w.append(Gcn3.v_add_u32(R.V12, 4, R.V12))
-  # load b[0..3]
   w += [Gcn3.v_mov_b32_sgpr(R.V12, R.S4), Gcn3.v_mov_b32_sgpr(R.V13, R.S5)]
   for vd in (R.V8, R.V9, R.V10, R.V11):
     w += list(Gcn3.flat_load_dword(vd, R.V12))
     if vd != R.V11:
       w.append(Gcn3.v_add_u32(R.V12, 4, R.V12))
   w.append(Op.S_WAITCNT_VM0_LGKM0)
-  # ARITHMETIC: v_op_f32 v{4+i}, v{8+i}, v{4+i}
   for i in range(4):
     w.append(Gcn3.v_binop_f32(alu_op, R.V4 + i, R.V8 + i, R.V4 + i))
-  # COMMON_SUFFIX: store out[0..3]
   w += [Gcn3.v_mov_b32_sgpr(R.V12, R.S0), Gcn3.v_mov_b32_sgpr(R.V13, R.S1)]
   for vd in (R.V4, R.V5, R.V6, R.V7):
     w += list(Gcn3.flat_store_dword(R.V12, vd))
@@ -492,10 +493,66 @@ def build_shader(alu_op: int) -> bytes:
   w += [Op.S_WAITCNT_VM0_LGKM0, Op.S_ENDPGM]
   return Gcn3.words_blob(w)
 
-ALU_OP = Gcn3.Op.V_MUL_F32
-OP = lambda x, y: x * y
-OP_NAME = "mul"
-ADD_SHADER = build_shader(ALU_OP)
+def build_shader_incr() -> bytes:
+  """TrustOS AGENT_INCR_GCN4 (flat): out[i] = a[i] + 1 (u32). s[0:1]=out, s[2:3]=a."""
+  R, Op = Gcn3.Reg, Gcn3.Op
+  w: list[int] = []
+  w += [Gcn3.v_mov_b32_imm(i, 4 * i) for i in (R.V0, R.V1, R.V2, R.V3)]
+  w += [Gcn3.v_mov_b32_sgpr(R.V12, R.S2), Gcn3.v_mov_b32_sgpr(R.V13, R.S3)]
+  for vd in (R.V4, R.V5, R.V6, R.V7):
+    w += list(Gcn3.flat_load_dword(vd, R.V12))
+    if vd != R.V7:
+      w.append(Gcn3.v_add_u32(R.V12, 4, R.V12))
+  w.append(Op.S_WAITCNT_VM0_LGKM0)
+  for vd in (R.V4, R.V5, R.V6, R.V7):
+    w.append(Gcn3.v_add_u32(vd, 1, vd))
+  w += [Gcn3.v_mov_b32_sgpr(R.V12, R.S0), Gcn3.v_mov_b32_sgpr(R.V13, R.S1)]
+  for vd in (R.V4, R.V5, R.V6, R.V7):
+    w += list(Gcn3.flat_store_dword(R.V12, vd))
+    if vd != R.V7:
+      w.append(Gcn3.v_add_u32(R.V12, 4, R.V12))
+  w += [Op.S_WAITCNT_VM0_LGKM0, Op.S_ENDPGM]
+  return Gcn3.words_blob(w)
+
+def build_shader_memfill() -> bytes:
+  """TrustOS AGENT_MEMFILL_GCN4 (flat): out[i] = fill (u32). s[0:1]=out, s[2]=fill."""
+  R, Op = Gcn3.Reg, Gcn3.Op
+  w: list[int] = []
+  w += [Gcn3.v_mov_b32_imm(i, 4 * i) for i in (R.V0, R.V1, R.V2, R.V3)]
+  w.append(Gcn3.v_mov_b32_sgpr(R.V4, R.S2))  # fill value
+  w += [Gcn3.v_mov_b32_sgpr(R.V12, R.S0), Gcn3.v_mov_b32_sgpr(R.V13, R.S1)]
+  for i, _ in enumerate(range(4)):
+    w += list(Gcn3.flat_store_dword(R.V12, R.V4))
+    if i != 3:
+      w.append(Gcn3.v_add_u32(R.V12, 4, R.V12))
+  w += [Op.S_WAITCNT_VM0_LGKM0, Op.S_ENDPGM]
+  return Gcn3.words_blob(w)
+
+def build_shader_memcopy() -> bytes:
+  """TrustOS AGENT_MEMCOPY_GCN4 (flat): out[i] = a[i] (u32). s[0:1]=out, s[2:3]=a."""
+  R, Op = Gcn3.Reg, Gcn3.Op
+  w: list[int] = []
+  w += [Gcn3.v_mov_b32_imm(i, 4 * i) for i in (R.V0, R.V1, R.V2, R.V3)]
+  w += [Gcn3.v_mov_b32_sgpr(R.V12, R.S2), Gcn3.v_mov_b32_sgpr(R.V13, R.S3)]
+  for vd in (R.V4, R.V5, R.V6, R.V7):
+    w += list(Gcn3.flat_load_dword(vd, R.V12))
+    if vd != R.V7:
+      w.append(Gcn3.v_add_u32(R.V12, 4, R.V12))
+  w.append(Op.S_WAITCNT_VM0_LGKM0)
+  w += [Gcn3.v_mov_b32_sgpr(R.V12, R.S0), Gcn3.v_mov_b32_sgpr(R.V13, R.S1)]
+  for vd in (R.V4, R.V5, R.V6, R.V7):
+    w += list(Gcn3.flat_store_dword(R.V12, vd))
+    if vd != R.V7:
+      w.append(Gcn3.v_add_u32(R.V12, 4, R.V12))
+  w += [Op.S_WAITCNT_VM0_LGKM0, Op.S_ENDPGM]
+  return Gcn3.words_blob(w)
+
+
+ALU_OP = None  # unary u32
+OP = lambda x, _y=0: (int(x) + 1) & 0xffffffff
+OP_NAME = "incr"
+ADD_SHADER = build_shader_incr()
+KIND = "incr"  # unary: only a used; b ignored
 PKT3_EVENT_WRITE = 0x46
 EVENT_TYPE_CS_PARTIAL_FLUSH = 7
 EVENT_INDEX_CS_PARTIAL_FLUSH = 4
@@ -5524,9 +5581,9 @@ class PolarisDevice:
       cases = getattr(self, "_op_cases", None) or [((1.0, 2.0, 3.0, 4.0), (10.0, 20.0, 30.0, 40.0))]
       for a, b_vals in cases:
         result = self.run_add(a, b_vals)
-        expected = [OP(x, y) for x, y in zip(a, b_vals)]
+        expected = expected_for(a, b_vals)
         print(f"stage=add a={list(a)} b={list(b_vals)} result={result}")
-        if not all(abs(r - e) < 1e-4 for r, e in zip(result, expected)):
+        if result != expected and not all(abs(float(r) - float(e)) < 1e-4 for r, e in zip(result, expected)):
           raise RuntimeError(f"vector-{OP_NAME} failed: expected {expected}, got {result}")
       return
     if stage == "kiq-nop":
@@ -5568,10 +5625,17 @@ class PolarisDevice:
       self.upload(off, data)
       return self.vram_gpu_addr(off), None
 
-    expected = [OP(x, y) for x, y in zip(a, b_vals)]
-    a_bytes = struct.pack("4f", *a)
-    b_bytes = struct.pack("4f", *b_vals)
-    out_bytes = bytes(16)
+    expected = expected_for(a, b_vals)
+    kind = globals().get("KIND", "binop")
+    if kind in ("incr", "memfill", "memcopy"):
+      a_u = [int(x) & 0xffffffff for x in a]
+      a_bytes = struct.pack("4I", *a_u)
+      b_bytes = struct.pack("4I", 0, 0, 0, 0)
+      out_bytes = bytes(16)
+    else:
+      a_bytes = struct.pack("4f", *a)
+      b_bytes = struct.pack("4f", *b_vals)
+      out_bytes = bytes(16)
     a_va, _ = put_buf(a_bytes)
     b_va, _ = put_buf(b_bytes)
     out_va, out_mem = put_buf(out_bytes)
@@ -5592,14 +5656,20 @@ class PolarisDevice:
     while time.time() < deadline:
       if out_mem is not None:
         sysmem_dma_flush(out_mem, 16)
-        result = list(struct.unpack("4f", bytes(out_mem[0:16])))
+        raw = bytes(out_mem[0:16])
       else:
         out_off = out_va - (self._vram_start or 0)
-        result = list(struct.unpack("4f", bytes(self.vram[out_off:out_off + 16])))
-      # float compare: exact for these smoke values; allow tiny noise
-      if all(abs(r - e) < 1e-5 for r, e in zip(result, expected)):
-        result = list(expected)
-        break
+        raw = bytes(self.vram[out_off:out_off + 16])
+      kind = globals().get("KIND", "binop")
+      if kind in ("incr", "memfill", "memcopy"):
+        result = list(struct.unpack("4I", raw))
+        if result == expected:
+          break
+      else:
+        result = list(struct.unpack("4f", raw))
+        if all(abs(r - e) < 1e-5 for r, e in zip(result, expected)):
+          result = list(expected)
+          break
       time.sleep(0.01)
     print(f"result={result} drained={drained}")
     return result
@@ -5635,9 +5705,9 @@ def probe():
 
 def selftest():
   ib = PM4Builder().build_dispatch_ib(0x10000, 0x20000, 0x30000, 0x40000)
-  assert len(ADD_SHADER) == 200
-  assert ADD_SHADER == build_shader(ALU_OP)
-  assert build_shader(Gcn3.Op.V_ADD_F32) != ADD_SHADER
+  assert ADD_SHADER == build_shader_incr()
+  assert build_shader_memfill() != ADD_SHADER
+  assert len(ADD_SHADER) >= 40
   assert len(ib) >= 20
   assert ib[0] >> 30 == PKT_TYPE3
   set_pkt = [pkt3(PACKET3_SET_RESOURCES, 6), 0, 1, 0, 0, 0, 0, 0]
@@ -5701,8 +5771,18 @@ def apply_add_defaults():
     os.environ.setdefault(k, v)
 
 
+
+def expected_for(a, b_vals):
+  kind = globals().get("KIND", "binop")
+  if kind == "memfill":
+    fill = int(a[0]) & 0xffffffff
+    return [fill, fill, fill, fill]
+  if kind in ("incr", "memcopy"):
+    return [OP(x) for x in a]
+  return [OP(x, y) for x, y in zip(a, b_vals)]
+
 def parse_vec4(s: str) -> tuple[float, float, float, float]:
-  parts = [float(x) for x in s.replace(" ", "").split(",") if x]
+  parts = [float(x) if ("." in x or "e" in x.lower()) else int(x, 0) for x in s.replace(" ", "").split(",") if x]
   if len(parts) != 4:
     raise SystemExit(f"need 4 floats, got {parts!r} from {s!r}")
   return (parts[0], parts[1], parts[2], parts[3])
@@ -5711,15 +5791,26 @@ def parse_vec4(s: str) -> tuple[float, float, float, float]:
 def parse_op_cases(argv: list[str]) -> list[tuple[tuple[float, ...], tuple[float, ...]]]:
   """CLI: default one case; --a/--b one case; --test several; --cases a:b;a:b"""
   if "--test" in argv:
-    return [
-      ((1.0, 2.0, 3.0, 4.0), (10.0, 20.0, 30.0, 40.0)),
-      ((0.0, 0.0, 0.0, 0.0), (5.0, 5.0, 5.0, 5.0)),
-      ((-1.0, 2.0, -3.0, 4.0), (2.0, -2.0, 2.0, -2.0)),
-      ((0.5, 1.5, 2.5, 3.5), (2.0, 2.0, 2.0, 2.0)),
-      ((1e3, -1e3, 0.125, -0.5), (2.0, 0.5, 8.0, -4.0)),
-    ]
-  a = (1.0, 2.0, 3.0, 4.0)
-  b = (10.0, 20.0, 30.0, 40.0)
+    kind = globals().get("KIND", "binop")
+    if kind == "memfill":
+      return [((0xA5A5A5A5, 0, 0, 0), (0, 0, 0, 0)),
+              ((0xDEADBEEF, 0, 0, 0), (0, 0, 0, 0)),
+              ((0, 0, 0, 0), (0, 0, 0, 0)),
+              ((1, 0, 0, 0), (0, 0, 0, 0)),
+              ((0xFFFFFFFF, 0, 0, 0), (0, 0, 0, 0))]
+    if kind in ("incr", "memcopy"):
+      return [((1, 2, 3, 4), (0, 0, 0, 0)),
+              ((0, 0, 0, 0), (0, 0, 0, 0)),
+              ((0xFFFFFFFE, 10, 20, 30), (0, 0, 0, 0)),
+              ((100, 200, 300, 400), (0, 0, 0, 0)),
+              ((0x7FFFFFFF, 1, 2, 3), (0, 0, 0, 0))]
+  kind = globals().get("KIND", "binop")
+  if kind == "memfill":
+    a, b = (0xA5A5A5A5, 0, 0, 0), (0, 0, 0, 0)
+  elif kind in ("incr", "memcopy"):
+    a, b = (1, 2, 3, 4), (0, 0, 0, 0)
+  else:
+    a, b = (1.0, 2.0, 3.0, 4.0), (10.0, 20.0, 30.0, 40.0)
   for i, arg in enumerate(argv):
     if arg == "--a" and i + 1 < len(argv):
       a = parse_vec4(argv[i + 1])

@@ -148,6 +148,57 @@ good reference before reverse-engineering the GFX PM4 packets for a direct
 
 See `docs/raw-gfx-triangle.md` for the raw GFX PM4 capture/replay workflow.
 
+## RX570 eGPU (`examples_egpu/`)
+
+Bare-metal Polaris10 / gfx803 (`1002:67df`) over TinyGPU.app on M1 Mac USB4 —
+standalone scripts (`add.py`, `mul.py`, `neural.py`, …), not macOS `AMDRadeon*`
+kexts. See `examples_egpu/progress.md` for bring-up history.
+
+## Terascale eGPU (`examples_egpu_terrascale/`)
+
+Scaffold for **HD 5570** (Redwood / Evergreen, TeraScale 2) and **HD 4850**
+(RV770 / R700, TeraScale 1) over the same TinyGPU transport. Uses linux
+**`drm/radeon`** (`ref/linux/drivers/gpu/drm/radeon/`) and Mesa evergreen
+compute PM4 — not GCN/`amdgpu`. Hardware bring-up is pending; offline:
+
+```sh
+python3 examples_egpu_terrascale/add.py --selftest --chip=hd5570
+python3 examples_egpu_terrascale/add.py --dry-run --chip=hd4850
+```
+
+See `examples_egpu_terrascale/README.md`.
+
+### VRAM limitation (important)
+
+On this path **GDDR is not a usable CPU/GPU data store**:
+
+| Symptom | Meaning |
+| --- | --- |
+| `MC_SEQ_STATUS_M` lacks `CMD_RDY` | Memory controller not live for GDDR traffic |
+| BAR0 / `MM_INDEX` writes vanish after HDP flush | Posted latch only; value does not stick in VRAM |
+| `probe_bar0_writes()` / `probe_vram_mm_writes()` | Strict checks that require survival past HDP |
+
+**Consequence:** KCQ ring, MQD, EOP, shaders, and a/b/out buffers all go through
+**AGP (physically contiguous host sysmem)** via `AMD_BOOT_COMPUTE_AGP=1`, not
+BAR0 VRAM. Do not put rings or payloads at FB MC addresses — that caused PCIe
+panics when GDDR was dead.
+
+**Capacity:** Smoke tests use tiny vectors (4×f32, 2×2 GEMM) on purpose.
+AGP can hold more than 16 bytes, but large contiguous DMA allocations are hard
+on macOS. Bigger working sets need either:
+
+1. **GART/GTT** — map non-contiguous sysmem pages (walker must be solid), or
+2. **Fix VRAM** — train GDDR until `CMD_RDY` and HDP-surviving BAR0/MM writes.
+
+GPU `memcopy` only copies between two already-reachable addresses; it does not
+create a VRAM data path.
+
+```sh
+python3 examples_egpu/add.py
+python3 examples_egpu/neural.py --op=gemm --test
+python3 examples_egpu/add.py --probe   # prints BAR0 ok/FAIL after HDP
+```
+
 ## Notes
 
 The blog post uses an RDNA3/Navi31-style GPU (`gfx1100`). This machine uses
