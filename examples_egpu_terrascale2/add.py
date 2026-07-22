@@ -545,7 +545,7 @@ def S_0288D4_NUM_GPRS(x: int) -> int:
   return (x & 0xFF) << 0
 
 def S_0288D4_DX10_CLAMP(x: int) -> int:
-  return (x & 1) << 13
+  return (x & 1) << 21
 
 def S_0288D4_STACK_SIZE(x: int) -> int:
   return (x & 0xFF) << 8
@@ -1169,25 +1169,48 @@ def build_redwood_add_dispatch(shader_gpu: int, pool_gpu: int, cb_gpu: int,
   # context bank; only compute launch/target state uses PACKET3_COMPUTE_MODE.
   p.compute = False
   rat_base_reg = REG_CB_COLOR0_BASE_EG + rat_id * 0x3C
+  # DIM = width_elements - 1 (Mesa evergreen_state.c:1149).  width_elements
+  # equals pipe_buffer->width0 (size in bytes), so DIM = size_bytes - 1, NOT
+  # size_bytes/4 - 1.  FMASK must be 0 for a non-MSAA RAT buffer.
   p.set_context_reg_seq(rat_base_reg,
-                        rat_gpu >> 8, 511, 0, 0, rat_info, 1 << 4, PAGE_SIZE,
-                        0, 0, rat_gpu >> 8, 0, 0, 0)
-  p.set_context_reg(REG_CB_COLOR_CONTROL, 0xCC << 16)
-  p.set_context_reg(REG_CB_TARGET_MASK_EG + 4, 0)
+                        rat_gpu >> 8, 511, 0, 0, rat_info, 1 << 4, PAGE_SIZE - 1,
+                        0, 0, 0, 0, 0, 0)
+  # Evergreen CB_COLOR_CONTROL: MODE=CB_NORMAL(1) is required for any CB/RAT
+  # write — MODE=0 is CB_DISABLE on Evergreen (Mesa evergreend.h:695-696),
+  # unlike R600 where the same bits are SPECIAL_OP and 0 means "normal".
+  # Mesa evergreen_state.c:369-370 sets MODE=CB_NORMAL when target_mask!=0.
+  p.set_context_reg(REG_CB_COLOR_CONTROL, (1 << 4) | (0xCC << 16))
+  # CB_SHADER_MASK must match the shader's export mask exactly (Mesa
+  # evergreen_state.c:2204-2207: "This must match the used export instructions
+  # exactly. Other values may lead to undefined behavior and hangs.").  Was 0,
+  # which silently dropped all RAT exports — root cause of the unchanged target.
+  p.set_context_reg(REG_CB_TARGET_MASK_EG + 4, 0xF << (rat_id * 4))
   p.compute = True
   p.set_context_reg(REG_CB_TARGET_MASK_EG, 0xF << (rat_id * 4))
+  # Pre-dispatch flush: Mesa r600_flush_emit uses non-compute packets with
+  # CP_COHER_BASE=0 (flush-all mode) and SMX_ACTION_ENA for CB coherency.
   p.pkt3(PKT3_SURFACE_SYNC,
          PACKET3_TC_ACTION_ENA | PACKET3_VC_ACTION_ENA | PACKET3_SH_ACTION_ENA |
-         PACKET3_CB_ACTION_ENA | (PACKET3_CB0_DEST_BASE_ENA << rat_id),
-         0xFFFFFFFF, 0, 10, compute=True)
+         PACKET3_CB_ACTION_ENA | PACKET3_SMX_ACTION_ENA |
+         (PACKET3_CB0_DEST_BASE_ENA << rat_id),
+         0xFFFFFFFF, 0, 10, compute=False)
   p.emit_cs_shader(shader_gpu, ngpr=2, nstack=0)
   p.emit_dispatch(block=(1, 1, 1), grid=(1, 1, 1), lds_dwords=0, num_waves=1)
   # Complete the LS work and flush RAT data before the CP writes the fence.
+  # CS_PARTIAL_FLUSH (compute) waits for the compute shader to finish, but
+  # does NOT flush the CB cache.  CACHE_FLUSH_AND_INV_EVENT (non-compute,
+  # Mesa r600_flush_emit) is required to actually write CB-cached RAT data
+  # to memory.  Without it, the RAT write stays in the CB cache and never
+  # reaches the backing store — root cause of store_pattern_at=-1.
   p.pkt3(PKT3_EVENT_WRITE, 0x07 | (4 << 8), compute=True)
+  p.pkt3(PKT3_EVENT_WRITE, EVENT_TYPE_CACHE_FLUSH_AND_INV | (0 << 8), compute=False)
+  # SURFACE_SYNC: non-compute (Mesa r600_flush_emit), CP_COHER_BASE=0
+  # (flush-all mode), SMX_ACTION_ENA for CB coherency.
   p.pkt3(PKT3_SURFACE_SYNC,
          PACKET3_TC_ACTION_ENA | PACKET3_VC_ACTION_ENA | PACKET3_SH_ACTION_ENA |
-         PACKET3_CB_ACTION_ENA | (PACKET3_CB0_DEST_BASE_ENA << rat_id),
-         0xFFFFFFFF, pool_gpu >> 8, 10, compute=True)
+         PACKET3_CB_ACTION_ENA | PACKET3_SMX_ACTION_ENA |
+         (PACKET3_CB0_DEST_BASE_ENA << rat_id),
+         0xFFFFFFFF, 0, 10, compute=False)
   if trace_gpu is not None:
     trace_regs = (rat_base_reg, rat_base_reg + 4, rat_base_reg + 8, rat_base_reg + 12,
                   rat_base_reg + 16, rat_base_reg + 20,
@@ -1204,9 +1227,15 @@ def build_redwood_add_dispatch(shader_gpu: int, pool_gpu: int, cb_gpu: int,
     # GPU-side memory observation of RAT target dword 0 after the flush.
     p.pkt3(PKT3_COPY_DW, 3, lo32(pool_gpu), hi32(pool_gpu) & 0xFF,
            lo32(trace_gpu + 0x100), hi32(trace_gpu + 0x100) & 0xFF, compute=True)
-  d0, d1 = data64_le(fence_sequence)
-  p.pkt3(PKT3_MEM_WRITE, lo32(fence_gpu) & 0xFFFFFFFC, hi32(fence_gpu) & 0xFF,
-         d0, d1, compute=False)
+  # End-of-pipe fence: EVENT_WRITE_EOP writes the sequence only after all
+  # prior pipe operations (including the SURFACE_SYNC cache flush) complete.
+  # Matches Linux r600_fence_ring_emit (r600.c:2886-2891) for R600+ chips.
+  # MEM_WRITE would execute immediately without waiting for flush completion.
+  p.pkt3(PKT3_EVENT_WRITE_EOP,
+         EVENT_TYPE_CACHE_FLUSH_AND_INV_TS | (EVENT_INDEX_TS << 8),
+         lo32(fence_gpu),
+         (hi32(fence_gpu) & 0xFF) | (DATA_SEL_32 << 29) | (INT_SEL_NONE << 24),
+         fence_sequence & 0xFFFFFFFF, 0, compute=False)
   return p.words
 
 def emit_rv770_completion(p: "PM4Builder", fence_gpu: int, fence_sequence: int,
@@ -2086,7 +2115,7 @@ class TerrascaleDevice:
     self.wreg(REG_MC_VM_SYSTEM_APERTURE_HIGH, self.agp_end >> 12)
     self.wreg(REG_MC_VM_SYSTEM_APERTURE_DEFAULT, (fb_start_24 << 24) >> 12)
     self.wreg(REG_HDP_NONSURFACE_BASE, (fb_start_24 << 24) >> 8)
-    self.wreg(REG_HDP_NONSURFACE_INFO, (2 << 7))
+    self.wreg(REG_HDP_NONSURFACE_INFO, (2 << 7) | (1 << 30))  # evergreen.c:2910
     self.wreg(REG_HDP_NONSURFACE_SIZE, 0x3FFFFFFF)
     # r600_mc_program: clear all 32 HDP surface register groups (5 regs each,
     # stride 0x18).  Uncleared garbage here misroutes graphics-pipeline fetches
@@ -2098,6 +2127,7 @@ class TerrascaleDevice:
       self.wreg(0x2c1c + j, 0)
       self.wreg(0x2c20 + j, 0)
       self.wreg(0x2c24 + j, 0)
+    self.wreg(0x54A0, 0)  # HDP_REG_COHERENCY_FLUSH_CNTL (evergreen.c:2867)
     self.wreg(REG_MC_VM_AGP_BASE, 0)
     self.wreg(REG_MC_VM_AGP_TOP, (self.agp_end >> 16) & 0xFFFF)
     self.wreg(REG_MC_VM_AGP_BOT, (self.agp_start >> 16) & 0xFFFF)
@@ -2225,6 +2255,7 @@ class TerrascaleDevice:
     _ = self.rreg(REG_GRBM_SOFT_RESET)
     time.sleep(0.015)
     self.wreg(REG_GRBM_SOFT_RESET, 0)
+    _ = self.rreg(REG_GRBM_SOFT_RESET)  # posting read (evergreen.c:3084)
     # PFP - be32 in file
     self.wreg(REG_CP_PFP_UCODE_ADDR, 0)
     for i in range(pfp_dw):
@@ -2298,12 +2329,14 @@ class TerrascaleDevice:
     _ = self.rreg(REG_GRBM_SOFT_RESET)
     time.sleep(0.015)
     self.wreg(REG_GRBM_SOFT_RESET, 0)
+    _ = self.rreg(REG_GRBM_SOFT_RESET)  # posting read (evergreen.c:3084)
 
     rb_bufsz = (self.ring_size // 8).bit_length() - 1
     page_log = (PAGE_SIZE // 8).bit_length() - 1
     tmp = (page_log << 8) | rb_bufsz
     self.wreg(REG_CP_RB_CNTL, tmp)
     self.wreg(REG_CP_SEM_WAIT_TIMER, 0)
+    self.wreg(0x85C8, 0)  # CP_SEM_INCOMPLETE_TIMER_CNTL (evergreen.c:3094)
     self.wreg(REG_CP_RB_WPTR_DELAY, 0)
     self.wreg(REG_CP_RB_CNTL, tmp | RB_RPTR_WR_ENA)
     self.wreg(REG_CP_RB_RPTR_WR, 0)
@@ -2386,6 +2419,10 @@ class TerrascaleDevice:
     self.wreg(0x8C24, 42 | (42 << 16))
     self.wreg(0x8C28, 42 | (42 << 16))
     self.wreg(0x8E2C, 8192 << 16)
+    # HDP coherency: evergreen.c:3701-3706 sets HDP_FLUSH_INVALIDATE_CACHE
+    # and does a HDP_HOST_PATH_CNTL read-modify-write to flush the HDP cache.
+    self.wreg(0x2F4C, self.rreg(0x2F4C) | 0x1)  # HDP_MISC_CNTL |= FLUSH_INVALIDATE
+    self.wreg(0x2C00, self.rreg(0x2C00))        # HDP_HOST_PATH_CNTL RMW flush
     self.pci.drain_mmio(self.mmio_bar)
     print("terrascale2: initialized Redwood SQ/cache resources", flush=True)
 
@@ -3542,6 +3579,7 @@ class TerrascaleDevice:
     # prior timed-out draw.
     time.sleep(0.050)
     self.wreg(REG_GRBM_SOFT_RESET, 0)
+    _ = self.rreg(REG_GRBM_SOFT_RESET)  # posting read
     # ponytail: CP stays HALTED until all graphics registers are written.
     # Linux does rv770_gpu_init BEFORE cp_resume; we halt CP here and resume
     # only after all golden/SQ/DB registers are programmed (pass 9 audit B27).
