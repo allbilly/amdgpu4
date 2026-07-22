@@ -1,6 +1,6 @@
 # HD 4850 eGPU Bring-Up Progress (TinyGPU / M1 Mac)
 
-**Last updated:** 2026-07-21
+**Last updated:** 2026-07-22
 
 ## Current blocker
 
@@ -59,7 +59,7 @@ Results (synth + this hook):
 | `--atom` (repair-after-MemoryPLLInit) + `--cp-mem-write-test` | **PASS** |
 | VRAM stick (MM/BAR0) | **FAIL** (float) |
 | `--cp-mem-write-test` | **PASS** — CP writes a supplied payload to AGP-mapped host sysmem; this is **not GPU add** |
-| Default `add.py` | **REFUSES** — RV770 GPU ALU/shader path is not implemented; no CPU fallback |
+| Default `add.py` | **PASS** — real RV770 VS/PS ALU add through AGP; no CPU fallback |
 | `AMD_ATOM_PATCH_MPLL` | **Do not use** |
 
 `add.py` now maps BAR0 lazily: only `--vram-probe` (or an explicit
@@ -80,6 +80,15 @@ is therefore ATOM power/training or board hardware (especially MVDD/GDDR3), not
 CP or AGP setup.
 
 ## Real RV770 add status
+
+**Resolved 2026-07-22:** the vertex-fetch instruction correctly used R700
+buffer ID 160, but `PKT3_SET_RESOURCE` incorrectly programmed descriptor
+offset 160 instead of Mesa's vertex-buffer offset 320. After splitting those
+number spaces, PARAM0 fetches correctly. Removing the synthetic position PS
+input then maps PARAM0/PARAM1 to LLVM's expected GPR0/GPR1, and the four
+hardware ADDs return `[11, 22, 33, 44]` for `[1, 2, 3, 4] + [10, 20, 30, 40]`.
+Mixed-sign/decimal vectors and repeated submissions also pass on the attached
+`1002:9442` card. The older entries below record the bring-up path to this fix.
 
 `rv770_add.ll` now compiles with LLVM's `-march=r600 -mcpu=rv770` backend to a
 64-byte pixel shader containing exactly four hardware `ADD` instructions and a

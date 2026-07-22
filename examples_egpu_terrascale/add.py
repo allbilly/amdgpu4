@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # NO CPU OFFLOAD: never label a CPU-calculated payload as a GPU add.  The
 # --cp-mem-write-test diagnostic only proves CP DMA; true GPU add must execute
-# an RV770 graphics/ALU shader and fails loudly until that path exists.
+# the RV770 graphics/ALU shader and match its independently computed oracle.
 """Standalone Terascale eGPU vector-add scaffold (HD 5570 / HD 4850) over TinyGPU.
 
 Hardware not required yet - `--selftest` / `--dry-run` work offline. When the
@@ -13,8 +13,8 @@ Targets (linux `drivers/gpu/drm/radeon`):
 
 Evergreen has a real compute path (Mesa `evergreen_compute.c` / r600g OpenCL):
   SQ_PGM_START_LS + SPI_COMPUTE_NUM_THREAD_* + PKT3_DISPATCH_DIRECT (compute bit).
-RV770 shares the R600 CP ring (`r600_cp_resume`) but **no LS compute**; GFX/ALU
-path is stubbed until HW bring-up.
+RV770 shares the R600 CP ring (`r600_cp_resume`) but **no LS compute**; its
+graphics VS/PS path executes the four-component add through AGP host memory.
 
 Refs: `ref/linux/.../radeon/{evergreen,r600,rv770}.c`, `evergreend.h`, `r600d.h`.
 
@@ -29,7 +29,7 @@ Usage:
                                                         # CP/AGP payload-write diagnostic, not add
   python3 examples_egpu_terrascale/add.py --gpu-add-preflight
                                                         # allocates real VS/PS/input/target, no draw
-  python3 examples_egpu_terrascale/add.py                  # true GPU add; fails until RV770 ALU path lands
+  python3 examples_egpu_terrascale/add.py                  # true RV770 GPU add
 
 HD 4850: AGP-first (MEMSIZE=stub, FB@0xE0..., BIF off). Cold CHG -> --atom for MPLL;
 warm re-runs work with AMD_BOOT_ATOM=0. Default add never maps or accesses BAR0/VRAM.
@@ -583,7 +583,12 @@ REG_PA_SU_SC_MODE_CNTL, REG_PA_SC_MODE_CNTL = 0x28814, 0x28A4C
 REG_PA_SU_VTX_CNTL, REG_CB_COLOR_CONTROL = 0x28C08, 0x28808
 REG_CB_BLEND0_CONTROL, REG_CB_BLEND_CONTROL = 0x28780, 0x28804
 
-RV770_FETCH_RESOURCE_VS = 160
+# R700 uses different number spaces for the fetch instruction's 8-bit buffer
+# ID and PKT3_SET_RESOURCE's descriptor offset.  Mesa's fetch shader encodes
+# VS vertex buffer 0 as ID 160, while r600_emit_vertex_buffers programs its
+# seven-dword descriptor at OFFSET_FS 320.
+RV770_FETCH_BUFFER_ID_VS = 160
+RV770_FETCH_RESOURCE_FS = 320
 RV770_VTX_FORMAT_32_32_32_32_FLOAT = 0x23
 RV770_COLOR_32_32_32_32_FLOAT = 0x23
 RV770_DI_PT_TRILIST, RV770_DI_SRC_SEL_AUTO_INDEX = 4, 2
@@ -810,9 +815,9 @@ def compile_rv770_constant_ps_blob() -> bytes:
 
 def compile_rv770_param0_ps_blob() -> bytes:
   raw = compile_rv770_ps_blob(RV770_PARAM0_PS_LL)
-  # B53: With POSITION_ADDR=0, position→GPR0, PARAM0→GPR1.
-  # Patch export SRC_GPR from 0 to 1 to read PARAM0 from GPR1.
-  export_gpr = int(getenv("AMD_GPU_ADD_PS_EXPORT_GPR", "1"))
+  # Mesa allocates interpolated PS inputs from GPR0 upward.  This shader does
+  # not request VARYING_SLOT_POS, so PARAM0 remains in LLVM's expected GPR0.
+  export_gpr = int(getenv("AMD_GPU_ADD_PS_EXPORT_GPR", "0"))
   words = list(struct.unpack(f"<{len(raw)//4}I", raw))
   words[0] = (words[0] & ~(0x7F << 15)) | (export_gpr << 15)
   raw = struct.pack(f"<{len(words)}I", *words)
@@ -912,18 +917,19 @@ def build_rv770_vertex_fetch_blob() -> bytes:
   """Build Mesa's RV770 vertex-fetch program for ``position, a, b``.
 
   R700 does not fetch vertex attributes in the LLVM vertex shader.  Mesa emits
-  a small *fetch shader* at ``SQ_PGM_START_FS`` first; it reads resource 160
-  (the VS vertex-buffer resource bank) into GPRs 1, 2 and 3.  The LLVM VS then
-  receives those three vectors as T0, T1 and T2.  This is a direct Python
+  a small *fetch shader* at ``SQ_PGM_START_FS`` first; its instructions read
+  buffer ID 160 into GPRs 1, 2 and 3, while SET_RESOURCE programs that buffer's
+  descriptor at offset 320.  The LLVM VS then receives those three vectors as
+  T0, T1 and T2.  This is a direct Python
   transcription of ``r600_bytecode_vtx_build`` and
   ``r700_bytecode_cf_vtx_build`` for three RGBA32_FLOAT elements, not an
   invented opaque blob.
   """
   # r700_sq.h: VTX word fields.  VFETCH opcode=0, FETCH_VERTEX_DATA=0,
-  # resource 160 (R600_FETCH_CONSTANTS_OFFSET_VS), src_gpr=0/index.x,
+  # buffer ID 160, src_gpr=0/index.x,
   # mega_fetch_count=31, RGBA swizzle XYZW, FMT_32_32_32_32_FLOAT=0x23.
   def vfetch(dst_gpr: int, offset: int) -> list[int]:
-    word0 = (160 << 8) | (0x1F << 26)
+    word0 = (RV770_FETCH_BUFFER_ID_VS << 8) | (0x1F << 26)
     word1 = (dst_gpr << 0) | (0 << 9) | (1 << 12) | (2 << 15) | (3 << 18) | (0x23 << 22)
     word2 = (offset & 0xFFFF) | (1 << 19)  # MEGA_FETCH
     return [word0, word1, word2, 0]
@@ -1128,12 +1134,8 @@ def _rv770_stage_linkage(stage: str) -> tuple[int, tuple[int, ...]]:
   if stage in (GPU_ADD_STAGE_CONSTANT, GPU_ADD_STAGE_STREAM):
     return 0, ()
   if stage == GPU_ADD_STAGE_PARAM0:
-    # B53: Mesa includes position in NUM_INTERP and SPI_PS_INPUT_CNTL.
-    # Input 0 = position (semantic 0, FLAT_SHADE), Input 1 = PARAM0 (semantic 1, SEL_LINEAR).
-    # Position→GPR0 (POSITION_ADDR=0), PARAM0→GPR1.
-    return 2, (0 | (1 << 10), 1 | (1 << 12))
-  # add: position + PARAM0 + PARAM1
-  return 3, (0 | (1 << 10), 1 | (1 << 12), 2 | (1 << 12))
+    return 1, (1 | (1 << 12),)  # PARAM0→GPR0
+  return 2, (1 | (1 << 12), 2 | (1 << 12))  # PARAM0/1→GPR0/1
 
 # r7xx_default_state from Linux radeon r600_blit_shaders.c (v5.17, pre-removal).
 # Raw PM4 dwords, CONTEXT_CONTROL stripped (caller emits it).  This is the
@@ -1239,15 +1241,15 @@ def build_rv770_add_draw(vs_gpu: int, ps_gpu: int, fetch_gpu: int,
   # not SET_CONFIG_REG.  The dedicated packet resets the instance counter
   # with the correct timing relative to the draw (B39).
   p.pkt3(PKT3_NUM_INSTANCES, 1, compute=False)
-  # r600_emit_vertex_buffers: resource bank VS=160; buffer is three 48-byte
-  # records.  The direct transport has no kernel relocation, hence the GPU
-  # aperture address is supplied in WORD0 rather than Mesa's reloc placeholder.
+  # r600_emit_vertex_buffers: descriptor offset FS=320 corresponds to fetch
+  # buffer ID 160; the buffer contains three 48-byte records.  The direct
+  # transport has no kernel relocation, so WORD0 contains the GPU address.
   if not constant_vs and not empty_vs:
     # ponytail: Match Mesa r600_emit_vertex_buffers (r600_state.c:1670-1680).
     # WORD0=offset, WORD1=size-1, WORD2=ENDIAN_SWAP|STRIDE, WORD3-5=0,
     # WORD6=VALID_BUFFER<<30.  B48: WORD3 must be 0 (Mesa sets 0); the
     # previous 1<<0 was from r600_blit_kms which uses a different path.
-    p.set_resource(RV770_FETCH_RESOURCE_VS,
+    p.set_resource(RV770_FETCH_RESOURCE_FS,
                    vertices_gpu, PAGE_SIZE - 1, 48 << 8, 0, 0, 0, 0xC0000000)
     # r600_blit_kms set_vtx_resource: SURFACE_SYNC(VC_ACTION_ENA) after vertex
     # buffer setup flushes the vertex cache so VGT sees CP-written vertex data.
@@ -1297,7 +1299,7 @@ def build_rv770_add_draw(vs_gpu: int, ps_gpu: int, fetch_gpu: int,
   sync_size = max(512, fetch_gpu + 256 - vs_gpu)
   p.pkt3(PKT3_SURFACE_SYNC, PACKET3_SH_ACTION_ENA,
          (sync_size + 255) >> 8, vs_gpu >> 8, 10, compute=False)
-  # VS always exports POS + PARAM0(sem0) + PARAM1(sem1); only the PS side
+  # VS always exports POS + PARAM0(sem1) + PARAM1(sem2); only the PS side
   # changes per stage (num_interp and which inputs are consumed).
   if empty_vs:
     # A CF_END-only VS exports no position/parameters; do not advertise the
@@ -1327,21 +1329,13 @@ def build_rv770_add_draw(vs_gpu: int, ps_gpu: int, fetch_gpu: int,
     # for an interpolated value that the PS doesn't consume.
     p.set_context_reg(REG_SPI_PS_INPUT_CNTL_0, 0)
   # B52: Mesa r600_state.c:2561-2563 ALWAYS sets PERSP_GRADIENT_ENA(1),
-  # even for LINEAR inputs. LINEAR_GRADIENT_ENA(need_linear) is set ONLY
-  # when at least one input uses TGSI_INTERPOLATE_LINEAR.  Our inputs are
-  # all PERSP, so need_linear=0.
-  # B53: BARYC_SAMPLE_CNTL(1) at bits 27:26 — Mesa sets this together with
-  # POSITION_ENA.  Without it, the SPI may not compute barycentric coordinates
-  # for interpolation, producing garbage.
-  spi_ctrl0 = num_interp | (1 << 28) | (1 << 29) | (1 << 26)  # PERSP+LINEAR+BARYC
-  # B53: POSITION_ENA only when there are interpolants — needed for barycentric.
-  # POSITION_ADDR=0: position→GPR0 (matching SPI_PS_INPUT_CNTL_0 = position).
-  if num_interp > 0 and not getenv("AMD_GPU_ADD_NO_POSITION_ENA", 0):
-    spi_ctrl0 |= (1 << 8)  # POSITION_ENA, POSITION_ADDR=0
+  # even for LINEAR inputs. LINEAR_GRADIENT_ENA(need_linear) is set when at
+  # least one input uses TGSI_INTERPOLATE_LINEAR; these inputs do.
+  spi_ctrl0 = num_interp | (1 << 28) | (1 << 29)  # PERSP+LINEAR gradients
   p.set_context_reg_seq(REG_SPI_PS_IN_CONTROL_0, spi_ctrl0, 0)
-  # B53: PROVIDE_Z_TO_SPI=1 — the SPI may need Z to compute barycentric
-  # coordinates for PERSP interpolation, even when the PS doesn't read position.
-  p.set_context_reg(REG_SPI_INPUT_Z, 1)
+  # Neither shader reads VARYING_SLOT_POS/gl_FragCoord.  POSITION_ENA and
+  # PROVIDE_Z_TO_SPI would allocate/overwrite a PS input GPR.
+  p.set_context_reg(REG_SPI_INPUT_Z, 0)
   # B53: VTX_XY_FMT(1) | VTX_W0_FMT(1): screen-space XY + W0=1 for PERSP.
   p.set_context_reg(REG_PA_CL_VTE_CNTL, (1 << 8) | (1 << 10))
   # CLIP_DISABLE(1) disables user clip planes.
@@ -3477,8 +3471,8 @@ class TerrascaleDevice:
       return [float(x) + float(y) for x, y in zip(a, b)]
     return None  # cp stage
 
-  def dump_gpu_add_registers(self, tag: str = "") -> dict:
-    """Snapshot graphics-relevant status/context registers (Phase 9.1)."""
+  def dump_gpu_add_registers(self, tag: str = "") -> dict[str, int | None]:
+    """Snapshot graphics registers that are directly visible in the MMIO BAR."""
     regs = {
       "CP_RB_RPTR": REG_CP_RB_RPTR, "CP_RB_WPTR": REG_CP_RB_WPTR,
       "CP_ME_CNTL": REG_CP_ME_CNTL, "GRBM_STATUS": REG_GRBM_STATUS,
@@ -3490,9 +3484,14 @@ class TerrascaleDevice:
       "DB_DEPTH_CONTROL": REG_DB_DEPTH_CONTROL,
       "PA_SC_MODE_CNTL": REG_PA_SC_MODE_CNTL,
     }
-    info = {k: self.rreg(v) for k, v in regs.items()}
+    # The HD 4850 exposes a 64-KiB MMIO BAR.  Context-register addresses such
+    # as 0x28040 are valid in PM4 SET_CONTEXT_REG packets but are not direct
+    # BAR offsets; asking TinyGPU to read past the mapping rejects the RPC.
+    info = {k: (self.rreg(v) if v + 4 <= self.mmio_size else None)
+            for k, v in regs.items()}
     print("terrascale: gfx regs" + (f" {tag}" if tag else "") + " " +
-          " ".join(f"{k}={v:#x}" for k, v in info.items()), flush=True)
+          " ".join(f"{k}={v:#x}" if v is not None else f"{k}=unavailable"
+                   for k, v in info.items()), flush=True)
     return info
 
   def run_add(self, a=(1.0, 2.0, 3.0, 4.0), b=(10.0, 20.0, 30.0, 40.0),
@@ -3628,8 +3627,12 @@ def selftest(chip: ChipInfo):
   # VFETCH resource 160, and GPR destinations 1/2/3.
   fetch_dw = struct.unpack("<20I", rv770_fetch_blob)
   assert fetch_dw[0] == 4 and (fetch_dw[1] & 0x7F800000) == (2 << 23)
-  assert [(fetch_dw[i] >> 8) & 0xFF for i in (8, 12, 16)] == [160, 160, 160]
+  assert [(fetch_dw[i] >> 8) & 0xFF for i in (8, 12, 16)] == [
+    RV770_FETCH_BUFFER_ID_VS, RV770_FETCH_BUFFER_ID_VS, RV770_FETCH_BUFFER_ID_VS]
   assert [fetch_dw[i] & 0x7F for i in (9, 13, 17)] == [1, 2, 3]
+  assert any(((w >> 8) & 0xFF) == PKT3_SET_RESOURCE and
+             rv770_draw[i + 1] == RV770_FETCH_RESOURCE_FS * 7
+             for i, w in enumerate(rv770_draw[:-1]))
   assert any(((w >> 8) & 0xFF) == PKT3_DRAW_INDEX_AUTO for w in rv770_draw)
   # A 0xffffffff body dword (e.g. SURFACE_SYNC flush mask) reads as a type3
   # header under a naive top-bit test; exclude it from the compute-mode check.
@@ -3651,6 +3654,8 @@ def selftest(chip: ChipInfo):
     w = build_rv770_add_draw(0x20000, 0x21000, 0x22000, 0x23000, 0x24000,
                              stage=st, fence_gpu=0x25000, fence_sequence=7)
     validate_gpu_add_pm4(w, color_gpu=0x24000, fence_gpu=0x25000, stage=st)
+  assert _rv770_stage_linkage(GPU_ADD_STAGE_PARAM0) == (1, (0x1001,))
+  assert _rv770_stage_linkage(GPU_ADD_STAGE_ADD) == (2, (0x1001, 0x1002))
   # The cp stage proves only the completion fence: no draw, one EOP.
   w_cp = build_rv770_add_draw(0x20000, 0x21000, 0x22000, 0x23000, 0x24000,
                               stage=GPU_ADD_STAGE_CP, fence_gpu=0x25000, fence_sequence=9)

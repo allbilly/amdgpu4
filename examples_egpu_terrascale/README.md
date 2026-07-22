@@ -17,8 +17,9 @@ User-space compute reference: Mesa **r600g** `evergreen_compute.c`
 
 ## Status
 
-`add.py` is offline-first, and the HD 4850 CP smoke path has been exercised
-with AGP-mapped host sysmem while local VRAM remains unusable:
+`add.py` is offline-first. The HD 4850 graphics add and CP smoke paths have
+both been exercised with AGP-mapped host sysmem while local VRAM remains
+unusable:
 
 ```bash
 python3 examples_egpu_terrascale/add.py --selftest --chip=hd5570
@@ -27,6 +28,7 @@ python3 examples_egpu_terrascale/add.py --dry-run --chip=hd5570
 python3 examples_egpu_terrascale/add.py --list-chips
 # when card + TinyGPU are up:
 python3 examples_egpu_terrascale/add.py --probe --chip=hd5570
+AMD_BOOT_ATOM=0 python3 examples_egpu_terrascale/add.py
 ```
 
 | Piece | HD 5570 (Evergreen) | HD 4850 (RV770) |
@@ -35,16 +37,16 @@ python3 examples_egpu_terrascale/add.py --probe --chip=hd5570
 | Chip / PCI ID table | ready | ready |
 | `r600_cp_resume` MMIO sequence (dry-run) | ready | ready |
 | Evergreen LS compute IB (Mesa-shaped) | ready | n/a |
-| Real r600 CF/ALU shader (`llvm -march=r600`) | **TODO** (stub blob) | **TODO** |
-| ATOM / MC / CP boot on TinyGPU | **TODO** | **TODO** |
+| Real r600 CF/ALU shader (`llvm -march=r600`) | **TODO** (stub blob) | ready, hardware-tested |
+| ATOM / MC / CP boot on TinyGPU | **TODO** | ready for AGP path |
 | RAT / global buffer bindings | **TODO** | n/a |
 
 For RV770, `--cp-mem-write-test` does not use local VRAM: it places the CP ring,
 writeback page, and `MEM_WRITE` result buffer in contiguous host sysmem behind
 the AGP aperture. BAR0 is deliberately lazy and only mapped for `--vram-probe`
 or an explicitly requested BAR0 probe. It is strictly a CP payload-write test,
-not GPU arithmetic; the default command refuses to CPU-offload an add. This is
-the supported diagnostic path while GDDR3 writes return a floating-bus value.
+not GPU arithmetic; the default command instead uses the real RV770 VS/PS ALU
+path. No CPU arithmetic or CP payload write is accepted as an add result.
 
 ## Evergreen compute path (HD 5570)
 
@@ -72,14 +74,14 @@ pixel stage:
 ```bash
 python3 examples_egpu_terrascale/add.py --compile-rv770-add
 AMD_BOOT_ATOM=0 python3 examples_egpu_terrascale/add.py --gpu-add-preflight
+AMD_BOOT_ATOM=0 python3 examples_egpu_terrascale/add.py
 ```
 
 The compiler inspection does not touch hardware. The preflight allocates the
 48-byte VS, 64-byte PS, three-vertex input buffer, and FP32 output target in
-contiguous AGP sysmem, but deliberately issues no graphics packets. The
-remaining work is to bind that state through the RV770 graphics draw pipeline
-and read the GPU-produced result. Until that exists, default `add.py` refuses
-to replace GPU arithmetic with a CPU calculation.
+contiguous AGP sysmem without issuing graphics packets. The default command
+binds that state, draws through the RV770 graphics pipeline, and verifies the
+GPU-produced FP32 result. Local GDDR3 is still not required for this AGP path.
 
 ## vs Polaris (`examples_egpu`)
 
